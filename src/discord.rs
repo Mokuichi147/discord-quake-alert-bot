@@ -37,8 +37,8 @@ pub fn build_payload(quake: &JmaQuake, reason: &str, with_image: bool, is_test: 
         format!("🚨 地震情報（最大震度 {}）", scale_label(eq.max_scale))
     };
 
-    // 出典表示。地図添付時は地理院タイルの出典とURLも明記する（利用規約上必須）。
-    let mut footer = String::from("出典: P2P地震情報");
+    // 出典表示。元データは気象庁（CC BY 4.0）。地図添付時は地理院タイルも明記する。
+    let mut footer = String::from("出典: 気象庁（P2P地震情報経由）");
     if with_image {
         footer.push_str(" ・ 地図: 地理院タイル https://maps.gsi.go.jp/development/ichiran.html");
     }
@@ -98,7 +98,7 @@ pub fn build_eew_payload(eew: &Eew, reason: &str, with_image: bool, is_test: boo
             "title": format!("{test_prefix}⚠️ 緊急地震速報 取消"),
             "description": "先ほどの緊急地震速報は取り消されました。",
             "color": 0x80_80_80,
-            "footer": { "text": "出典: P2P地震情報（緊急地震速報）" },
+            "footer": { "text": "出典: 気象庁 緊急地震速報（P2P地震情報経由）" },
         });
         return json!({ "embeds": [embed] });
     }
@@ -139,7 +139,7 @@ pub fn build_eew_payload(eew: &Eew, reason: &str, with_image: bool, is_test: boo
         scale_label(max_scale)
     );
 
-    let mut footer = String::from("出典: P2P地震情報（緊急地震速報・予想値）");
+    let mut footer = String::from("出典: 気象庁 緊急地震速報（P2P地震情報経由・予想値）");
     if with_image {
         footer.push_str(" ・ 地図: 地理院タイル https://maps.gsi.go.jp/development/ichiran.html");
     }
