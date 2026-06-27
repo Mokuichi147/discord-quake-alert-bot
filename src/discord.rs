@@ -3,8 +3,8 @@
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
 
-use crate::intensity::{embed_color, scale_label, tsunami_label};
-use crate::model::JmaQuake;
+use crate::intensity::{embed_color, eew_max_scale, scale_label, tsunami_label};
+use crate::model::{Eew, JmaQuake};
 
 const MAP_FILE_NAME: &str = "quake.webp";
 
@@ -22,19 +22,8 @@ pub fn build_payload(quake: &JmaQuake, reason: &str, with_image: bool, is_test: 
         hypo.name.clone()
     };
 
-    let magnitude = if eq.hypocenter.magnitude < 0.0 {
-        "不明".to_string()
-    } else {
-        format!("M{:.1}", eq.hypocenter.magnitude)
-    };
-
-    let depth = if hypo.depth < 0.0 {
-        "不明".to_string()
-    } else if hypo.depth == 0.0 {
-        "ごく浅い".to_string()
-    } else {
-        format!("{}km", hypo.depth as i64)
-    };
+    let magnitude = fmt_magnitude(eq.hypocenter.magnitude);
+    let depth = fmt_depth(hypo.depth);
 
     let time = if eq.time.is_empty() {
         "不明".to_string()
@@ -67,6 +56,104 @@ pub fn build_payload(quake: &JmaQuake, reason: &str, with_image: bool, is_test: 
             { "name": "深さ", "value": depth, "inline": true },
             { "name": "発生時刻", "value": time, "inline": false },
             { "name": "津波", "value": tsunami_label(&eq.domestic_tsunami), "inline": false },
+        ],
+        "footer": { "text": footer },
+    });
+
+    if with_image {
+        embed["image"] = json!({ "url": format!("attachment://{MAP_FILE_NAME}") });
+    }
+
+    json!({ "embeds": [embed] })
+}
+
+/// マグニチュード表記（不明は -1 未満で判定）。
+fn fmt_magnitude(magnitude: f64) -> String {
+    if magnitude < 0.0 {
+        "不明".to_string()
+    } else {
+        format!("M{magnitude:.1}")
+    }
+}
+
+/// 深さ表記（不明=負値、0=ごく浅い）。
+fn fmt_depth(depth: f64) -> String {
+    if depth < 0.0 {
+        "不明".to_string()
+    } else if depth == 0.0 {
+        "ごく浅い".to_string()
+    } else {
+        format!("{}km", depth as i64)
+    }
+}
+
+/// 緊急地震速報(556)から Discord embed の payload を組み立てる。
+///
+/// 取消報(`cancelled`)の場合は取消の embed を返す。
+pub fn build_eew_payload(eew: &Eew, reason: &str, with_image: bool, is_test: bool) -> Value {
+    let test_prefix = if is_test { "🧪【テスト通知】" } else { "" };
+
+    if eew.cancelled {
+        let embed = json!({
+            "title": format!("{test_prefix}⚠️ 緊急地震速報 取消"),
+            "description": "先ほどの緊急地震速報は取り消されました。",
+            "color": 0x80_80_80,
+            "footer": { "text": "出典: P2P地震情報（緊急地震速報）" },
+        });
+        return json!({ "embeds": [embed] });
+    }
+
+    let hypo = &eew.earthquake.hypocenter;
+    let max_scale = eew_max_scale(&eew.areas);
+
+    let place = if hypo.name.is_empty() {
+        "不明".to_string()
+    } else {
+        hypo.name.clone()
+    };
+    let time = if eew.issue.time.is_empty() {
+        "不明".to_string()
+    } else {
+        eew.issue.time.clone()
+    };
+
+    // 予想震度が高い順に対象地域名を列挙（最大8件）。
+    let mut areas: Vec<_> = eew.areas.iter().collect();
+    areas.sort_by(|a, b| b.scale_to.cmp(&a.scale_to));
+    let area_text = if areas.is_empty() {
+        "—".to_string()
+    } else {
+        let mut names: Vec<String> = areas
+            .iter()
+            .take(8)
+            .map(|a| format!("{}（{}）", a.name, scale_label(a.scale_to)))
+            .collect();
+        if areas.len() > 8 {
+            names.push(format!("ほか{}地域", areas.len() - 8));
+        }
+        names.join("\n")
+    };
+
+    let title = format!(
+        "{test_prefix}⚡ 緊急地震速報（予想最大震度 {}）",
+        scale_label(max_scale)
+    );
+
+    let mut footer = String::from("出典: P2P地震情報（緊急地震速報・予想値）");
+    if with_image {
+        footer.push_str(" ・ 地図: 地理院タイル https://maps.gsi.go.jp/development/ichiran.html");
+    }
+
+    let mut embed = json!({
+        "title": title,
+        "description": format!("{reason}（速報・予想値のため続報で変わることがあります）"),
+        "color": embed_color(max_scale),
+        "fields": [
+            { "name": "震源地", "value": place, "inline": true },
+            { "name": "マグニチュード", "value": fmt_magnitude(hypo.magnitude), "inline": true },
+            { "name": "深さ", "value": fmt_depth(hypo.depth), "inline": true },
+            { "name": "発表時刻", "value": time, "inline": false },
+            { "name": "強い揺れが予想される地域", "value": area_text, "inline": false },
         ],
         "footer": { "text": footer },
     });

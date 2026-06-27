@@ -69,6 +69,60 @@ pub struct Point {
     pub scale: i32,
 }
 
+/// code == 556 の緊急地震速報（警報）メッセージ全体。
+#[derive(Debug, Deserialize)]
+pub struct Eew {
+    pub code: i32,
+    /// 取消報なら true。
+    #[serde(default)]
+    pub cancelled: bool,
+    #[serde(default)]
+    pub issue: EewIssue,
+    #[serde(default)]
+    pub earthquake: EewEarthquake,
+    /// 警報対象地域ごとの予想震度。取消報では空のことがある。
+    #[serde(default)]
+    pub areas: Vec<EewArea>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct EewIssue {
+    /// 同一地震を束ねるID。重複報の判定に使う。
+    #[serde(rename = "eventId", default)]
+    pub event_id: String,
+    /// 報番号（"1" が第1報）。
+    #[serde(default)]
+    pub serial: String,
+    /// 発表時刻。
+    #[serde(default)]
+    pub time: String,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct EewEarthquake {
+    /// 地震発生時刻。
+    #[serde(rename = "originTime", default)]
+    pub origin_time: String,
+    #[serde(default)]
+    pub hypocenter: Hypocenter,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct EewArea {
+    /// 都府県名（例: "神奈川"。551と異なり接尾辞なし）。
+    #[serde(default)]
+    pub pref: String,
+    /// 地域名（例: "神奈川県西部"）。
+    #[serde(default)]
+    pub name: String,
+    /// 予想震度の下限スケール（551 と同じ値域）。
+    #[serde(rename = "scaleFrom", default = "minus_one")]
+    pub scale_from: i32,
+    /// 予想震度の上限スケール（551 と同じ値域）。
+    #[serde(rename = "scaleTo", default = "minus_one")]
+    pub scale_to: i32,
+}
+
 fn minus_one() -> i32 {
     -1
 }
