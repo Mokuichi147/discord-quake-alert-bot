@@ -3,7 +3,7 @@
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
 
-use crate::intensity::{embed_color, eew_max_scale, scale_label, tsunami_label};
+use crate::intensity::{embed_color, eew_max_scale, has_tsunami, scale_label, tsunami_label};
 use crate::model::{Eew, JmaQuake};
 
 const MAP_FILE_NAME: &str = "quake.webp";
@@ -31,10 +31,22 @@ pub fn build_payload(quake: &JmaQuake, reason: &str, with_image: bool, is_test: 
         eq.time.clone()
     };
 
-    let title = if is_test {
-        format!("🧪【テスト通知】地震情報（最大震度 {}）", scale_label(eq.max_scale))
+    // 津波情報がある場合はタイトルに 🌊 を付けて目立たせる。
+    let tsunami_mark = if has_tsunami(&eq.domestic_tsunami) {
+        "🌊"
     } else {
-        format!("🚨 地震情報（最大震度 {}）", scale_label(eq.max_scale))
+        ""
+    };
+    let title = if is_test {
+        format!(
+            "🧪【テスト通知】{tsunami_mark}地震情報（最大震度 {}）",
+            scale_label(eq.max_scale)
+        )
+    } else {
+        format!(
+            "🚨{tsunami_mark} 地震情報（最大震度 {}）",
+            scale_label(eq.max_scale)
+        )
     };
 
     // 出典表示。元データは気象庁（CC BY 4.0）。地図添付時は地理院タイルも明記する。

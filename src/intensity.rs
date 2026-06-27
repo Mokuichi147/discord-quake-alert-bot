@@ -76,6 +76,12 @@ pub fn tsunami_label(code: &str) -> &'static str {
     }
 }
 
+/// 津波に関する情報があるか（海面変動・注意報・警報・調査中）。
+/// 「なし(None)」「不明(Unknown 等)」は false。
+pub fn has_tsunami(code: &str) -> bool {
+    matches!(code, "NonEffective" | "Watch" | "Warning" | "Checking")
+}
+
 /// 通知判定結果。なぜ通知対象になったかの理由も保持する。
 #[derive(Debug)]
 pub struct NotifyDecision {
