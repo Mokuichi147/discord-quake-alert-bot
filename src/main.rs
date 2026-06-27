@@ -18,32 +18,34 @@ use tokio_tungstenite::tungstenite::Message;
 use tracing::{error, info, warn};
 
 use crate::config::Config;
-use crate::intensity::{decide, decide_eew, eew_max_scale};
-use crate::model::{Eew, Envelope, JmaQuake};
+use crate::intensity::{decide, decide_eew, eew_max_scale, tsunami_grade_rank};
+use crate::model::{Eew, Envelope, JmaQuake, Tsunami};
 
 /// 地震情報メッセージの code。
 const CODE_JMA_QUAKE: i32 = 551;
 /// 緊急地震速報（警報）メッセージの code。
 const CODE_EEW: i32 = 556;
+/// 津波予報メッセージの code。
+const CODE_TSUNAMI: i32 = 552;
 
-/// 緊急地震速報の重複報を抑制するため記録する eventId の上限。
-const SEEN_EEW_CAPACITY: usize = 256;
+/// 重複抑制のため記録する ID の上限。
+const SEEN_ID_CAPACITY: usize = 256;
 
-/// 通知済みの緊急地震速報 eventId を保持し、同一地震の続報を抑制する。
+/// 通知済みの ID を保持し、重複・続報を抑制する汎用の記録。
 #[derive(Default)]
-struct SeenEews {
+struct SeenIds {
     set: HashSet<String>,
     order: VecDeque<String>,
 }
 
-impl SeenEews {
-    /// 未通知なら記録して true を返す。既に通知済みなら false。
-    fn mark_if_new(&mut self, event_id: &str) -> bool {
-        if !self.set.insert(event_id.to_string()) {
+impl SeenIds {
+    /// 未登録なら記録して true を返す。既に登録済みなら false。
+    fn mark_if_new(&mut self, id: &str) -> bool {
+        if !self.set.insert(id.to_string()) {
             return false;
         }
-        self.order.push_back(event_id.to_string());
-        if self.order.len() > SEEN_EEW_CAPACITY {
+        self.order.push_back(id.to_string());
+        if self.order.len() > SEEN_ID_CAPACITY {
             if let Some(old) = self.order.pop_front() {
                 self.set.remove(&old);
             }
@@ -51,10 +53,19 @@ impl SeenEews {
         true
     }
 
-    /// 既に通知済みか。
-    fn contains(&self, event_id: &str) -> bool {
-        self.set.contains(event_id)
+    /// 既に登録済みか。
+    fn contains(&self, id: &str) -> bool {
+        self.set.contains(id)
     }
+}
+
+/// 種別ごとの重複抑制状態。
+#[derive(Default)]
+struct DedupState {
+    /// 緊急地震速報の eventId（第1報のみ通知）。
+    eews: SeenIds,
+    /// 津波予報の id（同一発表の再送を除去）。
+    tsunamis: SeenIds,
 }
 
 #[tokio::main]
@@ -72,7 +83,7 @@ async fn main() -> Result<()> {
     let config = Config::from_env()?;
     info!(
         ws_url = %config.ws_url,
-        kanto_min = config.kanto_min_scale,
+        regions = config.region_min_scales.len(),
         other_min = config.other_min_scale,
         attach_map = config.attach_map,
         "地震botを起動しました"
@@ -84,6 +95,9 @@ async fn main() -> Result<()> {
         .build()?;
 
     // テストモード: 過去のデータを1件取得して送信し終了する。
+    if std::env::args().any(|a| a == "--test-tsunami") {
+        return run_test_tsunami(&config, &http).await;
+    }
     if std::env::args().any(|a| a == "--test-eew") {
         return run_test_eew(&config, &http).await;
     }
@@ -91,13 +105,13 @@ async fn main() -> Result<()> {
         return run_test(&config, &http).await;
     }
 
-    // 緊急地震速報の重複報を抑制する状態。再接続をまたいで保持する。
-    let mut seen_eews = SeenEews::default();
+    // 重複報・再送を抑制する状態。再接続をまたいで保持する。
+    let mut dedup = DedupState::default();
 
     // 切断されても再接続し続ける。失敗時は指数バックオフ（最大60秒）。
     let mut backoff = Duration::from_secs(1);
     loop {
-        match run_once(&config, &http, &mut seen_eews).await {
+        match run_once(&config, &http, &mut dedup).await {
             Ok(()) => {
                 warn!("WebSocket 接続が終了しました。再接続します");
                 backoff = Duration::from_secs(1);
@@ -112,7 +126,7 @@ async fn main() -> Result<()> {
 }
 
 /// 1回の WebSocket セッションを処理する。正常切断で Ok を返す。
-async fn run_once(config: &Config, http: &reqwest::Client, seen: &mut SeenEews) -> Result<()> {
+async fn run_once(config: &Config, http: &reqwest::Client, dedup: &mut DedupState) -> Result<()> {
     let (ws_stream, _resp) = tokio_tungstenite::connect_async(config.ws_url.as_str()).await?;
     info!("WebSocket に接続しました");
     let (_write, mut read) = ws_stream.split();
@@ -121,7 +135,7 @@ async fn run_once(config: &Config, http: &reqwest::Client, seen: &mut SeenEews) 
         let message = message?;
         match message {
             Message::Text(text) => {
-                if let Err(e) = handle_text(config, http, &text, false, seen).await {
+                if let Err(e) = handle_text(config, http, &text, false, dedup).await {
                     error!(error = %e, "メッセージ処理に失敗");
                 }
             }
@@ -140,6 +154,8 @@ async fn run_once(config: &Config, http: &reqwest::Client, seen: &mut SeenEews) 
 const HISTORY_URL: &str = "https://api.p2pquake.net/v2/history?codes=551&limit=50";
 /// 過去の緊急地震速報 (556) のエンドポイント。
 const HISTORY_EEW_URL: &str = "https://api.p2pquake.net/v2/history?codes=556&limit=50";
+/// 過去の津波予報 (552) のエンドポイント。
+const HISTORY_TSUNAMI_URL: &str = "https://api.p2pquake.net/v2/history?codes=552&limit=50";
 
 /// テスト用: 過去の地震情報から通知条件を満たす最新の1件を選び、
 /// 本番と同じ経路 (handle_text) で Discord へ送信して終了する。
@@ -165,7 +181,7 @@ async fn run_test(config: &Config, http: &reqwest::Client) -> Result<()> {
         let decision = decide(
             &quake.earthquake,
             &quake.points,
-            config.kanto_min_scale,
+            &config.region_min_scales,
             config.other_min_scale,
         );
         if decision.notify {
@@ -175,7 +191,7 @@ async fn run_test(config: &Config, http: &reqwest::Client) -> Result<()> {
                 time = %quake.earthquake.time,
                 "テスト送信する地震を選択しました"
             );
-            handle_text(config, http, &text, true, &mut SeenEews::default()).await?;
+            handle_text(config, http, &text, true, &mut DedupState::default()).await?;
             info!("テスト送信が完了しました");
             return Ok(());
         }
@@ -200,7 +216,7 @@ async fn run_test_eew(config: &Config, http: &reqwest::Client) -> Result<()> {
     info!(count = items.len(), "履歴を取得しました");
 
     // テスト送信なので重複抑制は効かせない（毎回新しい状態を渡す）。
-    let mut seen = SeenEews::default();
+    let mut seen = SeenIds::default();
     for item in &items {
         let text = item.to_string();
         let eew: Eew = match serde_json::from_str(&text) {
@@ -210,7 +226,7 @@ async fn run_test_eew(config: &Config, http: &reqwest::Client) -> Result<()> {
         if eew.cancelled {
             continue;
         }
-        let decision = decide_eew(&eew.areas, config.kanto_min_scale, config.other_min_scale);
+        let decision = decide_eew(&eew.areas, &config.region_min_scales, config.other_min_scale);
         if decision.notify {
             info!(
                 place = %eew.earthquake.hypocenter.name,
@@ -228,6 +244,42 @@ async fn run_test_eew(config: &Config, http: &reqwest::Client) -> Result<()> {
     Ok(())
 }
 
+/// テスト用: 過去の津波予報から有効な1件を選び、本番経路 (handle_tsunami) で送信して終了する。
+async fn run_test_tsunami(config: &Config, http: &reqwest::Client) -> Result<()> {
+    info!("テストモード: 過去の津波予報を取得します");
+    let body = http
+        .get(HISTORY_TSUNAMI_URL)
+        .send()
+        .await?
+        .error_for_status()?
+        .text()
+        .await?;
+    let items: Vec<serde_json::Value> = serde_json::from_str(&body)?;
+    info!(count = items.len(), "履歴を取得しました");
+
+    let mut seen = SeenIds::default();
+    for item in &items {
+        let text = item.to_string();
+        let tsunami: Tsunami = match serde_json::from_str(&text) {
+            Ok(t) => t,
+            Err(_) => continue,
+        };
+        let has_grade = tsunami
+            .areas
+            .iter()
+            .any(|a| tsunami_grade_rank(&a.grade) > 0);
+        if !tsunami.cancelled && has_grade {
+            info!(areas = tsunami.areas.len(), "テスト送信する津波予報を選択しました");
+            handle_tsunami(config, http, &text, true, &mut seen).await?;
+            info!("テスト送信が完了しました");
+            return Ok(());
+        }
+    }
+
+    warn!("直近の履歴に津波予報がありませんでした（津波予報は稀に発表されます）");
+    Ok(())
+}
+
 /// 受信した1メッセージ(JSON文字列)を code で振り分けて処理する。
 ///
 /// `is_test` が true の場合、Discord 通知にテスト送信である旨を明示する。
@@ -236,7 +288,7 @@ async fn handle_text(
     http: &reqwest::Client,
     text: &str,
     is_test: bool,
-    seen: &mut SeenEews,
+    dedup: &mut DedupState,
 ) -> Result<()> {
     // まず code だけ取り出して種別を判定する。
     let envelope: Envelope = match serde_json::from_str(text) {
@@ -246,7 +298,8 @@ async fn handle_text(
 
     match envelope.code {
         CODE_JMA_QUAKE => handle_quake(config, http, text, is_test).await,
-        CODE_EEW => handle_eew(config, http, text, is_test, seen).await,
+        CODE_EEW => handle_eew(config, http, text, is_test, &mut dedup.eews).await,
+        CODE_TSUNAMI => handle_tsunami(config, http, text, is_test, &mut dedup.tsunamis).await,
         _ => Ok(()),
     }
 }
@@ -264,7 +317,7 @@ async fn handle_quake(
     let decision = decide(
         eq,
         &quake.points,
-        config.kanto_min_scale,
+        &config.region_min_scales,
         config.other_min_scale,
     );
 
@@ -322,7 +375,7 @@ async fn handle_eew(
     http: &reqwest::Client,
     text: &str,
     is_test: bool,
-    seen: &mut SeenEews,
+    seen: &mut SeenIds,
 ) -> Result<()> {
     let eew: Eew = serde_json::from_str(text)?;
     let event_id = eew.issue.event_id.clone();
@@ -339,7 +392,7 @@ async fn handle_eew(
         return Ok(());
     }
 
-    let decision = decide_eew(&eew.areas, config.kanto_min_scale, config.other_min_scale);
+    let decision = decide_eew(&eew.areas, &config.region_min_scales, config.other_min_scale);
     if !decision.notify {
         return Ok(());
     }
@@ -383,5 +436,48 @@ async fn handle_eew(
     let payload = discord::build_eew_payload(&eew, &decision.reason, image.is_some(), is_test);
     discord::send(http, &config.webhook_url, &payload, image).await?;
     info!("緊急地震速報を通知しました");
+    Ok(())
+}
+
+/// 津波予報(552) を処理する。
+///
+/// 同一発表(`id`)の再送は抑制する。発表・解除いずれも通知する。
+async fn handle_tsunami(
+    config: &Config,
+    http: &reqwest::Client,
+    text: &str,
+    is_test: bool,
+    seen: &mut SeenIds,
+) -> Result<()> {
+    let tsunami: Tsunami = serde_json::from_str(text)?;
+
+    // 同一発表の再送を除去する（id で重複判定）。
+    if !tsunami.id.is_empty() && !seen.mark_if_new(&tsunami.id) {
+        return Ok(());
+    }
+
+    if tsunami.cancelled {
+        info!("津波予報の解除を受信");
+        let payload = discord::build_tsunami_payload(&tsunami, is_test);
+        discord::send(http, &config.webhook_url, &payload, None).await?;
+        info!("津波予報の解除を通知しました");
+        return Ok(());
+    }
+
+    // 有効な予報（注意報以上）が含まれない場合は通知しない。
+    let max_rank = tsunami
+        .areas
+        .iter()
+        .map(|a| tsunami_grade_rank(&a.grade))
+        .max()
+        .unwrap_or(0);
+    if max_rank == 0 {
+        return Ok(());
+    }
+
+    info!(areas = tsunami.areas.len(), "津波予報を検出");
+    let payload = discord::build_tsunami_payload(&tsunami, is_test);
+    discord::send(http, &config.webhook_url, &payload, None).await?;
+    info!("津波予報を通知しました");
     Ok(())
 }

@@ -123,6 +123,67 @@ pub struct EewArea {
     pub scale_to: i32,
 }
 
+/// code == 552 の津波予報メッセージ全体。
+#[derive(Debug, Deserialize)]
+pub struct Tsunami {
+    pub code: i32,
+    /// WS重複除去用のID。
+    #[serde(default)]
+    pub id: String,
+    /// 津波予報が解除されたか。true の場合 `areas` は空。
+    #[serde(default)]
+    pub cancelled: bool,
+    #[serde(default)]
+    pub issue: TsunamiIssue,
+    /// 津波予報区ごとの詳細。
+    #[serde(default)]
+    pub areas: Vec<TsunamiArea>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct TsunamiIssue {
+    #[serde(default)]
+    pub source: String,
+    #[serde(default)]
+    pub time: String,
+    #[serde(rename = "type", default)]
+    pub issue_type: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct TsunamiArea {
+    /// 津波予報の種類（"MajorWarning" 大津波警報 / "Warning" 津波警報 / "Watch" 津波注意報）。
+    #[serde(default)]
+    pub grade: String,
+    /// 直ちに津波が来襲すると予想されているか。
+    #[serde(default)]
+    pub immediate: bool,
+    /// 津波予報区名。
+    #[serde(default)]
+    pub name: String,
+    #[serde(rename = "firstHeight", default)]
+    pub first_height: TsunamiFirstHeight,
+    #[serde(rename = "maxHeight", default)]
+    pub max_height: TsunamiMaxHeight,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct TsunamiFirstHeight {
+    /// 第1波の到達予想時刻。
+    #[serde(rename = "arrivalTime", default)]
+    pub arrival_time: String,
+    /// 到達状況（"ただちに津波来襲と予測" など）。
+    #[serde(default)]
+    pub condition: String,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct TsunamiMaxHeight {
+    /// 予想される高さの文字列表現（"巨大" "高い" "１０ｍ" など）。
+    #[serde(default)]
+    pub description: String,
+}
+
 fn minus_one() -> i32 {
     -1
 }

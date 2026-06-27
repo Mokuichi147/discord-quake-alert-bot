@@ -1,6 +1,10 @@
 //! 環境変数による設定。
 
+use std::collections::HashMap;
+
 use anyhow::{Context, Result};
+
+use crate::intensity::REGIONS;
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -8,9 +12,9 @@ pub struct Config {
     pub webhook_url: String,
     /// P2P地震情報 WebSocket エンドポイント。
     pub ws_url: String,
-    /// 関東で通知する最小スケール（既定 40 = 震度4）。
-    pub kanto_min_scale: i32,
-    /// 関東以外で通知する最小スケール（既定 50 = 震度5強）。
+    /// 地方ごとの通知する最小スケール（地方名→スケール）。未設定の地方は `other_min_scale`。
+    pub region_min_scales: HashMap<String, i32>,
+    /// どの地方区分にも該当しない（または未設定の）場合の最小スケール（既定 50 = 震度5強）。
     pub other_min_scale: i32,
     /// 地図画像を添付するか。
     pub attach_map: bool,
@@ -26,7 +30,16 @@ impl Config {
         let ws_url = std::env::var("P2PQUAKE_WS_URL")
             .unwrap_or_else(|_| "wss://api.p2pquake.net/v2/ws".to_string());
 
-        let kanto_min_scale = parse_scale("KANTO_MIN_SCALE", 40)?;
+        // 地方ごとの下限。関東のみ後方互換で既定40。他地方は環境変数があれば登録する。
+        let mut region_min_scales = HashMap::new();
+        for (name, prefix, _) in REGIONS {
+            let key = format!("{prefix}_MIN_SCALE");
+            if *name == "関東" {
+                region_min_scales.insert(name.to_string(), parse_scale(&key, 40)?);
+            } else if let Some(v) = optional_scale(&key)? {
+                region_min_scales.insert(name.to_string(), v);
+            }
+        }
         let other_min_scale = parse_scale("OTHER_MIN_SCALE", 50)?;
 
         let attach_map = std::env::var("ATTACH_MAP")
@@ -40,7 +53,7 @@ impl Config {
         Ok(Config {
             webhook_url,
             ws_url,
-            kanto_min_scale,
+            region_min_scales,
             other_min_scale,
             attach_map,
             tile_url_template,
@@ -54,5 +67,16 @@ fn parse_scale(key: &str, default: i32) -> Result<i32> {
             .parse::<i32>()
             .with_context(|| format!("環境変数 {key} は整数で指定してください: {v}")),
         Err(_) => Ok(default),
+    }
+}
+
+/// 環境変数があれば整数として解釈し `Some`、未設定なら `None` を返す。
+fn optional_scale(key: &str) -> Result<Option<i32>> {
+    match std::env::var(key) {
+        Ok(v) => v
+            .parse::<i32>()
+            .map(Some)
+            .with_context(|| format!("環境変数 {key} は整数で指定してください: {v}")),
+        Err(_) => Ok(None),
     }
 }

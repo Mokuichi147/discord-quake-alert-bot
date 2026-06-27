@@ -3,8 +3,11 @@
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
 
-use crate::intensity::{embed_color, eew_max_scale, has_tsunami, scale_label, tsunami_label};
-use crate::model::{Eew, JmaQuake};
+use crate::intensity::{
+    embed_color, eew_max_scale, has_tsunami, scale_label, tsunami_grade_color, tsunami_grade_label,
+    tsunami_grade_rank, tsunami_label,
+};
+use crate::model::{Eew, JmaQuake, Tsunami};
 
 const MAP_FILE_NAME: &str = "quake.webp";
 
@@ -173,6 +176,72 @@ pub fn build_eew_payload(eew: &Eew, reason: &str, with_image: bool, is_test: boo
     if with_image {
         embed["image"] = json!({ "url": format!("attachment://{MAP_FILE_NAME}") });
     }
+
+    json!({ "embeds": [embed] })
+}
+
+/// 津波予報(552)から Discord embed の payload を組み立てる。
+///
+/// 解除報(`cancelled`)の場合は解除の embed を返す。
+pub fn build_tsunami_payload(tsunami: &Tsunami, is_test: bool) -> Value {
+    let test_prefix = if is_test { "🧪【テスト通知】" } else { "" };
+
+    if tsunami.cancelled {
+        let embed = json!({
+            "title": format!("{test_prefix}🌊 津波予報 解除"),
+            "description": "津波予報（注意報・警報）はすべて解除されました。",
+            "color": 0x80_80_80,
+            "footer": { "text": "出典: 気象庁 津波予報（P2P地震情報経由）" },
+        });
+        return json!({ "embeds": [embed] });
+    }
+
+    // 最も深刻な grade をタイトル・色に使う。
+    let max_grade = tsunami
+        .areas
+        .iter()
+        .max_by_key(|a| tsunami_grade_rank(&a.grade))
+        .map(|a| a.grade.as_str())
+        .unwrap_or("");
+
+    // grade ごとに対象の津波予報区名をまとめる。
+    let mut fields = Vec::new();
+    for grade in ["MajorWarning", "Warning", "Watch"] {
+        let names: Vec<&str> = tsunami
+            .areas
+            .iter()
+            .filter(|a| a.grade == grade)
+            .map(|a| a.name.as_str())
+            .collect();
+        if !names.is_empty() {
+            fields.push(json!({
+                "name": tsunami_grade_label(grade),
+                "value": names.join("、"),
+                "inline": false,
+            }));
+        }
+    }
+
+    // 直ちに来襲のおそれがある場合は強調する。
+    let immediate = tsunami.areas.iter().any(|a| a.immediate);
+    let description = if immediate {
+        "津波予報が発表されています。**直ちに津波来襲のおそれ**があります。沿岸から離れてください。"
+    } else {
+        "津波予報が発表されています。沿岸では注意してください。"
+    };
+
+    let mut footer = String::from("出典: 気象庁 津波予報（P2P地震情報経由）");
+    if !tsunami.issue.time.is_empty() {
+        footer = format!("{footer} ・ 発表 {}", tsunami.issue.time);
+    }
+
+    let embed = json!({
+        "title": format!("{test_prefix}🌊 {}", tsunami_grade_label(max_grade)),
+        "description": description,
+        "color": tsunami_grade_color(max_grade),
+        "fields": fields,
+        "footer": { "text": footer },
+    });
 
     json!({ "embeds": [embed] })
 }

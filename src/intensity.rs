@@ -1,28 +1,61 @@
 //! 震度スケールの変換と、通知条件の判定ロジック。
 
+use std::collections::HashMap;
+
 use crate::model::{Earthquake, EewArea, Point};
 
-/// 関東地方の都道府県（551 の `points.pref` 表記。接尾辞あり）。
-pub const KANTO_PREFS: [&str; 7] = [
-    "茨城県",
-    "栃木県",
-    "群馬県",
-    "埼玉県",
-    "千葉県",
-    "東京都",
-    "神奈川県",
+/// 地方区分。`(地方名, 環境変数の接頭辞, 含む都道府県の正規化形)`。
+///
+/// 正規化形は末尾の「都/府/県」を除いた表記（北海道は「道」を残す）。これにより
+/// 551 の `points.pref`（"東京都"）と 556 の `areas.pref`（"東京"）の両方を同一キーで扱える。
+pub const REGIONS: &[(&str, &str, &[&str])] = &[
+    ("北海道", "HOKKAIDO", &["北海道"]),
+    ("東北", "TOHOKU", &["青森", "岩手", "宮城", "秋田", "山形", "福島"]),
+    ("関東", "KANTO", &["茨城", "栃木", "群馬", "埼玉", "千葉", "東京", "神奈川"]),
+    (
+        "中部",
+        "CHUBU",
+        &["新潟", "富山", "石川", "福井", "山梨", "長野", "岐阜", "静岡", "愛知"],
+    ),
+    ("近畿", "KINKI", &["三重", "滋賀", "京都", "大阪", "兵庫", "奈良", "和歌山"]),
+    ("中国", "CHUGOKU", &["鳥取", "島根", "岡山", "広島", "山口"]),
+    ("四国", "SHIKOKU", &["徳島", "香川", "愛媛", "高知"]),
+    (
+        "九州",
+        "KYUSHU",
+        &["福岡", "佐賀", "長崎", "熊本", "大分", "宮崎", "鹿児島", "沖縄"],
+    ),
 ];
 
-/// 関東地方の都府県（緊急地震速報 556 の `areas.pref` 表記。接尾辞なし）。
-pub const KANTO_PREFS_EEW: [&str; 7] = [
-    "茨城",
-    "栃木",
-    "群馬",
-    "埼玉",
-    "千葉",
-    "東京",
-    "神奈川",
-];
+/// 都道府県名を正規化する。末尾の「都/府/県」を除く（「道」は残す）。
+/// 例: "東京都"→"東京", "大阪府"→"大阪", "北海道"→"北海道", "東京"→"東京"。
+pub fn normalize_pref(pref: &str) -> &str {
+    pref.strip_suffix('都')
+        .or_else(|| pref.strip_suffix('府'))
+        .or_else(|| pref.strip_suffix('県'))
+        .unwrap_or(pref)
+}
+
+/// 都道府県(正規化前でも可)が属する地方名を返す。該当なしは None。
+pub fn region_of(pref: &str) -> Option<&'static str> {
+    let np = normalize_pref(pref);
+    REGIONS
+        .iter()
+        .find(|(_, _, prefs)| prefs.contains(&np))
+        .map(|(name, _, _)| *name)
+}
+
+/// 地方の通知下限を返す。設定がなければ `other_min_scale` にフォールバックする。
+fn region_threshold(
+    region: Option<&str>,
+    region_min_scales: &HashMap<String, i32>,
+    other_min_scale: i32,
+) -> i32 {
+    region
+        .and_then(|r| region_min_scales.get(r))
+        .copied()
+        .unwrap_or(other_min_scale)
+}
 
 /// P2P地震情報のscale値を震度表記へ変換する。
 pub fn scale_label(scale: i32) -> &'static str {
@@ -82,6 +115,36 @@ pub fn has_tsunami(code: &str) -> bool {
     matches!(code, "NonEffective" | "Watch" | "Warning" | "Checking")
 }
 
+/// 津波予報(552)の種別(`grade`)を日本語表記へ。
+pub fn tsunami_grade_label(grade: &str) -> &'static str {
+    match grade {
+        "MajorWarning" => "大津波警報",
+        "Warning" => "津波警報",
+        "Watch" => "津波注意報",
+        _ => "津波予報",
+    }
+}
+
+/// 津波予報の重大度ランク（高いほど深刻）。最大 grade の選定に使う。
+pub fn tsunami_grade_rank(grade: &str) -> i32 {
+    match grade {
+        "MajorWarning" => 3,
+        "Warning" => 2,
+        "Watch" => 1,
+        _ => 0,
+    }
+}
+
+/// 津波予報の embed カラー（深刻なほど濃い色）。
+pub fn tsunami_grade_color(grade: &str) -> u32 {
+    match grade {
+        "MajorWarning" => 0x99_00_99, // 大津波警報: 紫
+        "Warning" => 0xE0_00_00,      // 津波警報: 赤
+        "Watch" => 0xFF_C0_00,        // 津波注意報: 黄
+        _ => 0x33_99_FF,
+    }
+}
+
 /// 通知判定結果。なぜ通知対象になったかの理由も保持する。
 #[derive(Debug)]
 pub struct NotifyDecision {
@@ -89,35 +152,34 @@ pub struct NotifyDecision {
     pub reason: String,
 }
 
-/// 通知すべきかを判定する。
+/// 通知すべきかを判定する（地震情報 551 の観測震度版）。
 ///
-/// - 関東のいずれかの地点で震度が `kanto_min_scale` 以上 → 通知
-/// - もしくは全国の最大震度が `other_min_scale` 以上 → 通知
-///
-/// 既定では「関東で震度4以上、それ以外は震度5強以上」。
+/// 各地点を地方区分に分類し、その地方の下限（`region_min_scales`、未設定は
+/// `other_min_scale` にフォールバック）以上の地点があれば通知する。
+/// 地点情報がない場合は、全国最大震度を `other_min_scale` と比較する。
 pub fn decide(
     eq: &Earthquake,
     points: &[Point],
-    kanto_min_scale: i32,
+    region_min_scales: &HashMap<String, i32>,
     other_min_scale: i32,
 ) -> NotifyDecision {
-    let kanto_hit = points.iter().any(|p| {
-        KANTO_PREFS.contains(&p.pref.as_str()) && p.scale >= kanto_min_scale
-    });
+    let mut best: Option<(&str, i32)> = None;
+    for p in points {
+        let region = region_of(&p.pref);
+        let threshold = region_threshold(region, region_min_scales, other_min_scale);
+        if p.scale >= threshold && best.is_none_or(|(_, s)| p.scale > s) {
+            best = Some((region.unwrap_or("全国"), p.scale));
+        }
+    }
 
-    if kanto_hit {
-        let max_kanto = points
-            .iter()
-            .filter(|p| KANTO_PREFS.contains(&p.pref.as_str()))
-            .map(|p| p.scale)
-            .max()
-            .unwrap_or(-1);
+    if let Some((label, scale)) = best {
         return NotifyDecision {
             notify: true,
-            reason: format!("関東で最大震度{}を観測", scale_label(max_kanto)),
+            reason: format!("{label}で最大震度{}を観測", scale_label(scale)),
         };
     }
 
+    // 地点情報がない場合のフォールバック。
     if eq.max_scale >= other_min_scale {
         return NotifyDecision {
             notify: true,
@@ -133,29 +195,26 @@ pub fn decide(
 
 /// 緊急地震速報(556)の通知判定。`decide` の予想震度版。
 ///
-/// - 関東いずれかの地域で予想震度（`scale_to`）が `kanto_min_scale` 以上 → 通知
-/// - もしくは全国の予想最大震度が `other_min_scale` 以上 → 通知
-pub fn decide_eew(areas: &[EewArea], kanto_min_scale: i32, other_min_scale: i32) -> NotifyDecision {
-    let max_kanto = areas
-        .iter()
-        .filter(|a| KANTO_PREFS_EEW.contains(&a.pref.as_str()))
-        .map(|a| a.scale_to)
-        .max();
-
-    if let Some(max_kanto) = max_kanto {
-        if max_kanto >= kanto_min_scale {
-            return NotifyDecision {
-                notify: true,
-                reason: format!("関東で予想最大震度{}", scale_label(max_kanto)),
-            };
+/// 各地域を地方区分に分類し、地方の下限（未設定は `other_min_scale`）以上の
+/// 予想震度（`scale_to`）があれば通知する。
+pub fn decide_eew(
+    areas: &[EewArea],
+    region_min_scales: &HashMap<String, i32>,
+    other_min_scale: i32,
+) -> NotifyDecision {
+    let mut best: Option<(&str, i32)> = None;
+    for a in areas {
+        let region = region_of(&a.pref);
+        let threshold = region_threshold(region, region_min_scales, other_min_scale);
+        if a.scale_to >= threshold && best.is_none_or(|(_, s)| a.scale_to > s) {
+            best = Some((region.unwrap_or("全国"), a.scale_to));
         }
     }
 
-    let max_all = areas.iter().map(|a| a.scale_to).max().unwrap_or(-1);
-    if max_all >= other_min_scale {
+    if let Some((label, scale)) = best {
         return NotifyDecision {
             notify: true,
-            reason: format!("全国で予想最大震度{}", scale_label(max_all)),
+            reason: format!("{label}で予想最大震度{}", scale_label(scale)),
         };
     }
 
@@ -183,6 +242,23 @@ mod tests {
         }
     }
 
+    /// 既定相当（関東40・その他50、他地方は未設定）の地方下限。
+    fn kanto40() -> HashMap<String, i32> {
+        HashMap::from([("関東".to_string(), 40)])
+    }
+
+    #[test]
+    fn normalize_and_region() {
+        assert_eq!(normalize_pref("東京都"), "東京");
+        assert_eq!(normalize_pref("大阪府"), "大阪");
+        assert_eq!(normalize_pref("北海道"), "北海道");
+        assert_eq!(normalize_pref("東京"), "東京");
+        assert_eq!(region_of("東京都"), Some("関東"));
+        assert_eq!(region_of("宮城"), Some("東北"));
+        assert_eq!(region_of("大阪府"), Some("近畿"));
+        assert_eq!(region_of("ハワイ"), None);
+    }
+
     #[test]
     fn kanto_shindo4_notifies() {
         let eq = Earthquake {
@@ -190,7 +266,9 @@ mod tests {
             ..Default::default()
         };
         let points = vec![pt("東京都", 40), pt("大阪府", 30)];
-        assert!(decide(&eq, &points, 40, 50).notify);
+        let d = decide(&eq, &points, &kanto40(), 50);
+        assert!(d.notify);
+        assert!(d.reason.contains("関東"));
     }
 
     #[test]
@@ -200,7 +278,7 @@ mod tests {
             ..Default::default()
         };
         let points = vec![pt("千葉県", 30)];
-        assert!(!decide(&eq, &points, 40, 50).notify);
+        assert!(!decide(&eq, &points, &kanto40(), 50).notify);
     }
 
     #[test]
@@ -209,9 +287,9 @@ mod tests {
             max_scale: 40,
             ..Default::default()
         };
-        // 関東以外で震度4のみ → 通知しない
+        // 関東以外で震度4のみ → 通知しない（北海道は未設定なので50が下限）
         let points = vec![pt("北海道", 40)];
-        assert!(!decide(&eq, &points, 40, 50).notify);
+        assert!(!decide(&eq, &points, &kanto40(), 50).notify);
 
         // 関東以外で震度5強 → 通知する
         let eq2 = Earthquake {
@@ -219,7 +297,22 @@ mod tests {
             ..Default::default()
         };
         let points2 = vec![pt("北海道", 50)];
-        assert!(decide(&eq2, &points2, 40, 50).notify);
+        assert!(decide(&eq2, &points2, &kanto40(), 50).notify);
+    }
+
+    #[test]
+    fn tohoku_threshold_applies() {
+        let eq = Earthquake {
+            max_scale: 40,
+            ..Default::default()
+        };
+        // 東北を40に設定 → 宮城の震度4で通知
+        let scales = HashMap::from([("関東".to_string(), 40), ("東北".to_string(), 40)]);
+        let d = decide(&eq, &[pt("宮城県", 40)], &scales, 50);
+        assert!(d.notify);
+        assert!(d.reason.contains("東北"));
+        // 東北を未設定にすると同じ震度4では通知しない（フォールバック50）
+        assert!(!decide(&eq, &[pt("宮城県", 40)], &kanto40(), 50).notify);
     }
 
     fn area(pref: &str, scale_to: i32) -> EewArea {
@@ -235,7 +328,7 @@ mod tests {
     fn eew_kanto_yosou4_notifies() {
         // 関東(接尾辞なしpref)で予想震度4 → 通知
         let areas = vec![area("神奈川", 40), area("大阪", 30)];
-        let d = decide_eew(&areas, 40, 50);
+        let d = decide_eew(&areas, &kanto40(), 50);
         assert!(d.notify);
         assert!(d.reason.contains("関東"));
     }
@@ -243,9 +336,9 @@ mod tests {
     #[test]
     fn eew_other_region_needs_5kyo() {
         // 関東外で予想震度4のみ → 通知しない
-        assert!(!decide_eew(&[area("北海道", 40)], 40, 50).notify);
+        assert!(!decide_eew(&[area("北海道", 40)], &kanto40(), 50).notify);
         // 関東外で予想震度5強 → 通知する
-        assert!(decide_eew(&[area("北海道", 50)], 40, 50).notify);
+        assert!(decide_eew(&[area("北海道", 50)], &kanto40(), 50).notify);
     }
 
     #[test]
