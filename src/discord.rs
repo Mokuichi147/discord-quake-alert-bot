@@ -6,7 +6,7 @@ use serde_json::{json, Value};
 use crate::intensity::{embed_color, scale_label, tsunami_label};
 use crate::model::JmaQuake;
 
-const MAP_FILE_NAME: &str = "quake.png";
+const MAP_FILE_NAME: &str = "quake.webp";
 
 /// 受信した地震情報から Discord embed の payload を組み立てる。
 ///
@@ -72,7 +72,7 @@ pub async fn send(
     let response = if let Some(bytes) = image {
         let part = reqwest::multipart::Part::bytes(bytes)
             .file_name(MAP_FILE_NAME)
-            .mime_str("image/png")?;
+            .mime_str("image/webp")?;
 
         let form = reqwest::multipart::Form::new()
             .text("payload_json", serde_json::to_string(payload)?)

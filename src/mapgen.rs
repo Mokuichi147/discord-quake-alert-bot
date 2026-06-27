@@ -1,8 +1,9 @@
-//! 震源地をプロットした地図画像(PNG)の生成。
+//! 震源地をプロットした地図画像(WebP)の生成。
 //!
 //! staticmap クレートで OpenStreetMap タイルを取得し、震源地に二重円マーカーを描く。
+//! staticmap は PNG しか出力できないため、生成後に WebP へ再エンコードして軽量化する。
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use staticmap::{
     tools::{CircleBuilder, Color},
     StaticMapBuilder,
@@ -10,7 +11,11 @@ use staticmap::{
 
 use crate::intensity::marker_rgb;
 
-/// 震源地を中心とした地図 PNG を生成し、バイト列で返す。
+/// WebP ロスレス圧縮の努力度（0.0〜100.0、高いほど高圧縮）。
+/// 地図は文字・境界線が多く、ロッシー圧縮だと劣化が目立つためロスレスを使う。
+const WEBP_EFFORT: f32 = 100.0;
+
+/// 震源地を中心とした地図 WebP を生成し、バイト列で返す。
 ///
 /// `scale` はマーカー色の決定に使う最大震度スケール。
 pub fn render_quake_map(
@@ -47,9 +52,24 @@ pub fn render_quake_map(
     map.add_tool(outline);
     map.add_tool(inner);
 
-    // タイル取得とレンダリングを行い PNG バイト列を返す。
+    // タイル取得とレンダリングを行い PNG バイト列を得る。
     // 注意: 内部のタイル取得は同期(ブロッキング)通信のため、
     // 呼び出し側で spawn_blocking 上から実行すること。
-    let bytes = map.encode_png()?;
-    Ok(bytes)
+    let png = map.encode_png()?;
+
+    // PNG を一旦デコードして WebP へ再エンコードし、ファイルサイズを軽量化する。
+    encode_webp(&png)
+}
+
+/// PNG バイト列をデコードし、WebP(ロスレス)へ再エンコードして返す。
+fn encode_webp(png: &[u8]) -> Result<Vec<u8>> {
+    let rgba = image::load_from_memory_with_format(png, image::ImageFormat::Png)?.to_rgba8();
+    let (w, h) = rgba.dimensions();
+
+    let encoder = webp::Encoder::from_rgba(rgba.as_raw(), w, h);
+    let webp = encoder
+        .encode_simple(true, WEBP_EFFORT)
+        .map_err(|e| anyhow!("WebP エンコードに失敗: {e:?}"))?;
+
+    Ok(webp.to_vec())
 }
