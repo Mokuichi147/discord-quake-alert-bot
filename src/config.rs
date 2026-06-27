@@ -30,13 +30,12 @@ impl Config {
         let ws_url = std::env::var("P2PQUAKE_WS_URL")
             .unwrap_or_else(|_| "wss://api.p2pquake.net/v2/ws".to_string());
 
-        // 地方ごとの下限。関東のみ後方互換で既定40。他地方は環境変数があれば登録する。
+        // 地方ごとの下限。環境変数が設定された地方のみ登録し、未設定の地方は
+        // other_min_scale にフォールバックする（特定地方の特別扱いはしない）。
         let mut region_min_scales = HashMap::new();
         for (name, prefix, _) in REGIONS {
             let key = format!("{prefix}_MIN_SCALE");
-            if *name == "関東" {
-                region_min_scales.insert(name.to_string(), parse_scale(&key, 40)?);
-            } else if let Some(v) = optional_scale(&key)? {
+            if let Some(v) = optional_scale(&key)? {
                 region_min_scales.insert(name.to_string(), v);
             }
         }
