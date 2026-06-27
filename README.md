@@ -127,3 +127,16 @@ RestartSec=5
 [Install]
 WantedBy=multi-user.target
 ```
+
+## ライセンス
+
+本プロジェクトのソースコードは [Unlicense](LICENSE)（パブリックドメインへの献納）です。著作権を主張せず、商用・非商用を問わず自由に利用・改変・再配布できます。
+
+ただし、**依存しているサードパーティ・ライブラリはそれぞれのライセンスに従います**。本botのバイナリには多数の Rust crate が含まれ、主なライセンスは次のとおりです（全件は `cargo metadata` で確認できます）。
+
+- 大半: `MIT` / `Apache-2.0`
+- その他: `BSD-2-Clause` / `BSD-3-Clause`（tiny-skia など描画系）、`ISC`、`Zlib`、`Unicode-3.0`（icu 系）、`MPL-2.0`（attohttpc, webpki-roots）など
+
+**バイナリを配布する場合**は、これら依存ライブラリの著作権表示・ライセンス文を保持・同梱する必要があります（`MPL-2.0` のコンポーネントは、該当部分のソース入手先を示す必要があります）。ライセンス表示の一覧は [`cargo-about`](https://github.com/EmbarkStudios/cargo-about) などで生成できます。GPL/AGPL など強いコピーレフトの依存は含まれていません。
+
+なお、配信データ・地図の出典表示（気象庁／地理院タイル）の義務については「注意事項」を参照してください。
