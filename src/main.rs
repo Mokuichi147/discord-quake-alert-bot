@@ -1,6 +1,6 @@
 //! 地震bot エントリポイント。
 //!
-//! P2P地震情報の WebSocket を購読し、関東を中心とした強い揺れの地震を
+//! P2P地震情報の WebSocket を購読し、日本国内の強い揺れの地震を
 //! 地図画像付きで Discord Webhook へ通知する。
 
 mod config;
