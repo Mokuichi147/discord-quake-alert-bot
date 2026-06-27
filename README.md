@@ -44,7 +44,7 @@ cargo test
 | `KANTO_MIN_SCALE` | `40` | 関東で通知する最小震度スケール |
 | `OTHER_MIN_SCALE` | `50` | 関東以外で通知する最小震度スケール |
 | `ATTACH_MAP` | `true` | 地図画像を添付するか |
-| `TILE_URL_TEMPLATE` | OpenStreetMap | 地図タイルの URL テンプレート |
+| `TILE_URL_TEMPLATE` | 地理院タイル(白地図 blank) | 地図タイルの URL テンプレート |
 | `P2PQUAKE_WS_URL` | `wss://api.p2pquake.net/v2/ws` | WebSocket エンドポイント |
 | `RUST_LOG` | `info` | ログレベル |
 
@@ -58,7 +58,7 @@ src/
   config.rs     … 環境変数の読み込み
   model.rs      … P2P地震情報 API のレスポンス型(serde)
   intensity.rs  … 震度変換・通知条件の判定（単体テストあり）
-  mapgen.rs     … 震源地をプロットした地図PNGの生成(staticmap)
+  mapgen.rs     … 震源地をプロットした地図WebPの生成(staticmap、既定は地理院タイル)
   discord.rs    … Discord embed の組み立てと Webhook 送信(multipart)
 ```
 
@@ -72,7 +72,7 @@ src/
 
 ## 注意事項
 
-- **地図タイルの利用規約**: 既定の OpenStreetMap 公式タイルは個人利用・低頻度を想定したものです。頻繁に利用する場合は [OSM のタイル利用ポリシー](https://operations.osmfoundation.org/policies/tiles/) を確認のうえ、商用タイルプロバイダや自前のタイルサーバへ差し替えてください（`TILE_URL_TEMPLATE`）。
+- **地図タイルの利用規約**: 既定は国土地理院の白地図(blank、日本全国・zoom 5〜14)タイルです。利用にあたっては出典「地理院タイル」の表示が必要で、本botは地図添付時に通知へ出典と[地理院タイル一覧ページ](https://maps.gsi.go.jp/development/ichiran.html)へのリンクを明記します。高頻度・大量利用の場合は[地理院タイルの利用規約](https://maps.gsi.go.jp/development/ichiran.html)を確認してください。OpenStreetMap など別のタイルへ差し替える場合は `TILE_URL_TEMPLATE` に `{z}/{x}/{y}` 形式の URL を設定します（例: `https://tile.openstreetmap.org/{z}/{x}/{y}.png`。OSM 公式タイルは[利用ポリシー](https://operations.osmfoundation.org/policies/tiles/)に注意）。
 - P2P地震情報は気象庁発表をもとにした第三者サービスです。緊急地震速報（予報・警報）そのものではなく、揺れの「予想/観測」情報を扱います。重大用途には公式情報源も併用してください。
 - 震源座標が不明な情報（`latitude`/`longitude` が無効値）では地図を添付せずテキストのみで通知します。
 

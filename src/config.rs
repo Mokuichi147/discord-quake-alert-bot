@@ -33,8 +33,9 @@ impl Config {
             .map(|v| !matches!(v.to_lowercase().as_str(), "0" | "false" | "no"))
             .unwrap_or(true);
 
-        let tile_url_template = std::env::var("TILE_URL_TEMPLATE")
-            .unwrap_or_else(|_| "https://tile.openstreetmap.org/{z}/{x}/{y}.png".to_string());
+        let tile_url_template = std::env::var("TILE_URL_TEMPLATE").unwrap_or_else(|_| {
+            "https://cyberjapandata.gsi.go.jp/xyz/blank/{z}/{x}/{y}.png".to_string()
+        });
 
         Ok(Config {
             webhook_url,

@@ -48,11 +48,14 @@ pub fn build_payload(quake: &JmaQuake, reason: &str, with_image: bool, is_test: 
         format!("🚨 地震情報（最大震度 {}）", scale_label(eq.max_scale))
     };
 
-    let footer = if is_test {
-        "出典: P2P地震情報 ・ これはテスト送信です"
-    } else {
-        "出典: P2P地震情報"
-    };
+    // 出典表示。地図添付時は地理院タイルの出典とURLも明記する（利用規約上必須）。
+    let mut footer = String::from("出典: P2P地震情報");
+    if with_image {
+        footer.push_str(" ・ 地図: 地理院タイル https://maps.gsi.go.jp/development/ichiran.html");
+    }
+    if is_test {
+        footer.push_str(" ・ これはテスト送信です");
+    }
 
     let mut embed = json!({
         "title": title,

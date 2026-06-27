@@ -1,6 +1,6 @@
 //! 震源地をプロットした地図画像(WebP)の生成。
 //!
-//! staticmap クレートで OpenStreetMap タイルを取得し、震源地に二重円マーカーを描く。
+//! staticmap クレートで地図タイル(既定は国土地理院の白地図)を取得し、震源地に二重円マーカーを描く。
 //! staticmap は PNG しか出力できないため、生成後に WebP へ再エンコードして軽量化する。
 
 use anyhow::{anyhow, Result};
@@ -15,6 +15,9 @@ use crate::intensity::marker_rgb;
 /// 地図は文字・境界線が多く、ロッシー圧縮だと劣化が目立つためロスレスを使う。
 const WEBP_EFFORT: f32 = 100.0;
 
+/// 地図のズームレベル（大きいほど拡大）。地理院白地図(blank)は 5〜14 に対応。
+const MAP_ZOOM: u8 = 8;
+
 /// 震源地を中心とした地図 WebP を生成し、バイト列で返す。
 ///
 /// `scale` はマーカー色の決定に使う最大震度スケール。
@@ -27,7 +30,7 @@ pub fn render_quake_map(
     let mut map = StaticMapBuilder::new()
         .width(640)
         .height(480)
-        .zoom(7)
+        .zoom(MAP_ZOOM)
         .url_template(tile_url_template)
         .build()?;
 
