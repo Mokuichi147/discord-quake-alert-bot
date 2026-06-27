@@ -11,7 +11,8 @@ const MAP_FILE_NAME: &str = "quake.webp";
 /// 受信した地震情報から Discord embed の payload を組み立てる。
 ///
 /// `with_image` が true の場合、地図画像を `attachment://` で参照する。
-pub fn build_payload(quake: &JmaQuake, reason: &str, with_image: bool) -> Value {
+/// `is_test` が true の場合、テスト送信であることをタイトルとフッターに明示する。
+pub fn build_payload(quake: &JmaQuake, reason: &str, with_image: bool, is_test: bool) -> Value {
     let eq = &quake.earthquake;
     let hypo = &eq.hypocenter;
 
@@ -41,8 +42,20 @@ pub fn build_payload(quake: &JmaQuake, reason: &str, with_image: bool) -> Value 
         eq.time.clone()
     };
 
+    let title = if is_test {
+        format!("🧪【テスト通知】地震情報（最大震度 {}）", scale_label(eq.max_scale))
+    } else {
+        format!("🚨 地震情報（最大震度 {}）", scale_label(eq.max_scale))
+    };
+
+    let footer = if is_test {
+        "出典: P2P地震情報 ・ これはテスト送信です"
+    } else {
+        "出典: P2P地震情報"
+    };
+
     let mut embed = json!({
-        "title": format!("🚨 地震情報（最大震度 {}）", scale_label(eq.max_scale)),
+        "title": title,
         "description": reason,
         "color": embed_color(eq.max_scale),
         "fields": [
@@ -52,7 +65,7 @@ pub fn build_payload(quake: &JmaQuake, reason: &str, with_image: bool) -> Value 
             { "name": "発生時刻", "value": time, "inline": false },
             { "name": "津波", "value": tsunami_label(&eq.domestic_tsunami), "inline": false },
         ],
-        "footer": { "text": "出典: P2P地震情報" },
+        "footer": { "text": footer },
     });
 
     if with_image {

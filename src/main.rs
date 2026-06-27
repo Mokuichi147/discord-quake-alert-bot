@@ -49,6 +49,11 @@ async fn main() -> Result<()> {
         .timeout(Duration::from_secs(30))
         .build()?;
 
+    // `--test` 指定時は、過去の地震情報を1件取得して Discord へ送信し終了する。
+    if std::env::args().any(|a| a == "--test") {
+        return run_test(&config, &http).await;
+    }
+
     // 切断されても再接続し続ける。失敗時は指数バックオフ（最大60秒）。
     let mut backoff = Duration::from_secs(1);
     loop {
@@ -76,7 +81,7 @@ async fn run_once(config: &Config, http: &reqwest::Client) -> Result<()> {
         let message = message?;
         match message {
             Message::Text(text) => {
-                if let Err(e) = handle_text(config, http, &text).await {
+                if let Err(e) = handle_text(config, http, &text, false).await {
                     error!(error = %e, "メッセージ処理に失敗");
                 }
             }
@@ -91,8 +96,62 @@ async fn run_once(config: &Config, http: &reqwest::Client) -> Result<()> {
     Ok(())
 }
 
+/// 過去の地震情報 (P2P地震情報 REST API) のエンドポイント。
+const HISTORY_URL: &str = "https://api.p2pquake.net/v2/history?codes=551&limit=50";
+
+/// テスト用: 過去の地震情報から通知条件を満たす最新の1件を選び、
+/// 本番と同じ経路 (handle_text) で Discord へ送信して終了する。
+async fn run_test(config: &Config, http: &reqwest::Client) -> Result<()> {
+    info!("テストモード: 過去の地震情報を取得します");
+    let body = http
+        .get(HISTORY_URL)
+        .send()
+        .await?
+        .error_for_status()?
+        .text()
+        .await?;
+    let items: Vec<serde_json::Value> = serde_json::from_str(&body)?;
+    info!(count = items.len(), "履歴を取得しました");
+
+    // 通知条件を満たす最新の地震を1件だけ送信する。
+    for item in &items {
+        let text = item.to_string();
+        let quake: JmaQuake = match serde_json::from_str(&text) {
+            Ok(q) => q,
+            Err(_) => continue,
+        };
+        let decision = decide(
+            &quake.earthquake,
+            &quake.points,
+            config.kanto_min_scale,
+            config.other_min_scale,
+        );
+        if decision.notify {
+            info!(
+                place = %quake.earthquake.hypocenter.name,
+                max_scale = quake.earthquake.max_scale,
+                time = %quake.earthquake.time,
+                "テスト送信する地震を選択しました"
+            );
+            handle_text(config, http, &text, true).await?;
+            info!("テスト送信が完了しました");
+            return Ok(());
+        }
+    }
+
+    warn!("直近の履歴に通知条件を満たす地震がありませんでした。しきい値を下げて再試行してください");
+    Ok(())
+}
+
 /// 受信した1メッセージ(JSON文字列)を処理する。
-async fn handle_text(config: &Config, http: &reqwest::Client, text: &str) -> Result<()> {
+///
+/// `is_test` が true の場合、Discord 通知にテスト送信である旨を明示する。
+async fn handle_text(
+    config: &Config,
+    http: &reqwest::Client,
+    text: &str,
+    is_test: bool,
+) -> Result<()> {
     // まず code だけ取り出して種別を判定する。
     let envelope: Envelope = match serde_json::from_str(text) {
         Ok(v) => v,
@@ -153,7 +212,7 @@ async fn handle_text(config: &Config, http: &reqwest::Client, text: &str) -> Res
         None
     };
 
-    let payload = discord::build_payload(&quake, &decision.reason, image.is_some());
+    let payload = discord::build_payload(&quake, &decision.reason, image.is_some(), is_test);
     discord::send(http, &config.webhook_url, &payload, image).await?;
     info!("Discord へ通知しました");
     Ok(())
