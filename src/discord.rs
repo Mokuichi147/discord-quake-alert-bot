@@ -106,25 +106,26 @@ pub fn build_payload(quake: &JmaQuake, reason: &str, with_image: bool, is_test: 
     json!({ "embeds": [embed] })
 }
 
-/// 1つの震度欄に並べる都道府県の上限。超過分は「ほかN県」に畳む。
-const MAX_PREFS_PER_SCALE: usize = 12;
+/// 1つの震度行に並べる名称の上限。超過分は「ほかN{単位}」に畳む。
+const MAX_NAMES_PER_SCALE: usize = 12;
 
-/// 観測点(`points`)を震度の高い順にまとめ、各震度ごとに観測した都道府県を列挙する。
+/// `(名称, 震度スケール)` の一覧を「震度X: 名称、名称…」形式にまとめる。
+/// 震度速報・地震情報・緊急地震速報で震度表記を統一するための共通整形。
 ///
-/// 観測震度のある点が1つも無ければ `None`（フィールドを出さない）。
-/// 同一震度の都道府県は出現順で重複を除き、`MAX_PREFS_PER_SCALE` を超えたら畳む。
-fn fmt_points(points: &[Point]) -> Option<String> {
+/// 震度の高い順に並べ、同一震度内は出現順で重複を除き、`MAX_NAMES_PER_SCALE` を
+/// 超えたら「ほかN{unit}」に畳む。対象が1つも無ければ `None`。
+fn fmt_intensity_groups(items: &[(&str, i32)], unit: &str) -> Option<String> {
     use std::collections::BTreeMap;
 
-    // scale -> 都道府県（出現順・重複なし）。BTreeMap でキー昇順に整列する。
-    let mut by_scale: BTreeMap<i32, Vec<String>> = BTreeMap::new();
-    for p in points {
-        if p.scale < 0 || p.pref.is_empty() {
+    // scale -> 名称（出現順・重複なし）。BTreeMap でキー昇順に整列する。
+    let mut by_scale: BTreeMap<i32, Vec<&str>> = BTreeMap::new();
+    for &(name, scale) in items {
+        if scale < 0 || name.is_empty() {
             continue;
         }
-        let prefs = by_scale.entry(p.scale).or_default();
-        if !prefs.iter().any(|x| x == &p.pref) {
-            prefs.push(p.pref.clone());
+        let names = by_scale.entry(scale).or_default();
+        if !names.contains(&name) {
+            names.push(name);
         }
     }
 
@@ -132,21 +133,28 @@ fn fmt_points(points: &[Point]) -> Option<String> {
         return None;
     }
 
-    // 震度の高い順に「震度X: 県、県…」の行を作る。
+    // 震度の高い順に「X: 名称、名称…」の行を作る（震度はフィールド名で示すため接頭辞は付けない）。
     let lines: Vec<String> = by_scale
         .iter()
         .rev()
-        .map(|(scale, prefs)| {
-            let shown = prefs.len().min(MAX_PREFS_PER_SCALE);
-            let mut joined = prefs[..shown].join("、");
-            if prefs.len() > shown {
-                joined.push_str(&format!(" ほか{}県", prefs.len() - shown));
+        .map(|(scale, names)| {
+            let shown = names.len().min(MAX_NAMES_PER_SCALE);
+            let mut joined = names[..shown].join("、");
+            if names.len() > shown {
+                joined.push_str(&format!(" ほか{}{unit}", names.len() - shown));
             }
-            format!("震度{}: {}", scale_label(*scale), joined)
+            format!("{}: {}", scale_label(*scale), joined)
         })
         .collect();
 
     Some(lines.join("\n"))
+}
+
+/// 観測点(`points`)を震度の高い順にまとめ、各震度ごとに観測した都道府県を列挙する。
+/// 観測震度のある点が1つも無ければ `None`（フィールドを出さない）。
+fn fmt_points(points: &[Point]) -> Option<String> {
+    let items: Vec<(&str, i32)> = points.iter().map(|p| (p.pref.as_str(), p.scale)).collect();
+    fmt_intensity_groups(&items, "県")
 }
 
 /// マグニチュード表記（不明は -1 未満で判定）。
@@ -199,22 +207,13 @@ pub fn build_eew_payload(eew: &Eew, reason: &str, with_image: bool, is_test: boo
         eew.issue.time.clone()
     };
 
-    // 予想震度が高い順に対象地域名を列挙（最大8件）。
-    let mut areas: Vec<_> = eew.areas.iter().collect();
-    areas.sort_by_key(|a| std::cmp::Reverse(a.scale_to));
-    let area_text = if areas.is_empty() {
-        "—".to_string()
-    } else {
-        let mut names: Vec<String> = areas
-            .iter()
-            .take(8)
-            .map(|a| format!("{}（{}）", a.name, scale_label(a.scale_to)))
-            .collect();
-        if areas.len() > 8 {
-            names.push(format!("ほか{}地域", areas.len() - 8));
-        }
-        names.join("\n")
-    };
+    // 対象地域を予想震度ごとにまとめる（震度速報・地震情報と同じ「震度X: …」表記に統一）。
+    let area_items: Vec<(&str, i32)> = eew
+        .areas
+        .iter()
+        .map(|a| (a.name.as_str(), a.scale_to))
+        .collect();
+    let area_text = fmt_intensity_groups(&area_items, "地域").unwrap_or_else(|| "—".to_string());
 
     let title = format!(
         "{test_prefix}⚡ 緊急地震速報（予想最大震度 {}）",
@@ -432,7 +431,7 @@ mod tests {
             pt("岩手県", 40),
         ];
         let text = fmt_points(&points).expect("観測点があるので Some");
-        assert_eq!(text, "震度5弱: 宮城県\n震度4: 福島県、岩手県");
+        assert_eq!(text, "5弱: 宮城県\n4: 福島県、岩手県");
     }
 
     #[test]
@@ -444,10 +443,22 @@ mod tests {
 
     #[test]
     fn points_over_limit_are_folded() {
-        let points: Vec<Point> = (0..MAX_PREFS_PER_SCALE + 3)
+        let points: Vec<Point> = (0..MAX_NAMES_PER_SCALE + 3)
             .map(|i| pt(&format!("県{i}"), 40))
             .collect();
         let text = fmt_points(&points).unwrap();
         assert!(text.contains("ほか3県"), "超過分が畳まれる: {text}");
+    }
+
+    #[test]
+    fn eew_areas_use_same_intensity_notation() {
+        // 緊急地震速報の対象地域も震度速報と同じ「震度X: …」表記に統一する。
+        let items = vec![
+            ("神奈川県西部", 45),
+            ("東京都23区", 40),
+            ("神奈川県東部", 45),
+        ];
+        let text = fmt_intensity_groups(&items, "地域").unwrap();
+        assert_eq!(text, "5弱: 神奈川県西部、神奈川県東部\n4: 東京都23区");
     }
 }
