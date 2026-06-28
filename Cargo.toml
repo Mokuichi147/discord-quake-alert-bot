@@ -3,7 +3,7 @@ name = "quake-alert-bot"
 version = "0.1.0"
 edition = "2021"
 license = "Unlicense"
-description = "P2P地震情報のWebSocketを購読し、関東を中心に強い揺れの地震をDiscord Webhookへ地図画像付きで通知するbot"
+description = "P2P地震情報のWebSocketを購読し、日本国内の強い揺れの地震をDiscord Webhookへ地図画像付きで通知するbot"
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }

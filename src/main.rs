@@ -1,6 +1,6 @@
 //! 地震bot エントリポイント。
 //!
-//! P2P地震情報の WebSocket を購読し、関東を中心とした強い揺れの地震を
+//! P2P地震情報の WebSocket を購読し、日本国内の強い揺れの地震を
 //! 地図画像付きで Discord Webhook へ通知する。
 
 mod config;
@@ -9,7 +9,9 @@ mod intensity;
 mod mapgen;
 mod model;
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::hash_map::DefaultHasher;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::hash::{Hash, Hasher};
 use std::time::Duration;
 
 use anyhow::Result;
@@ -59,6 +61,53 @@ impl SeenIds {
     }
 }
 
+/// 地震情報(551)の1報あたりの投稿状態。差し替え用に message_id と内容ハッシュを保持する。
+struct QuakePost {
+    /// 表示内容のハッシュ。一致すれば再投稿しない。
+    signature: u64,
+    /// 投稿済み Discord メッセージの ID。内容変更時はこれを編集する。
+    message_id: String,
+}
+
+/// 同一地震（発生時刻キー）について、速報・詳報それぞれの投稿状態を別管理する。
+#[derive(Default)]
+struct QuakeEntry {
+    /// 震度速報（ScalePrompt）の投稿状態。
+    prompt: Option<QuakePost>,
+    /// 詳報（各地の震度など）の投稿状態。
+    detail: Option<QuakePost>,
+}
+
+/// 地震情報(551)の投稿状態を発生時刻ごとに保持する。容量超過で古い順に退避する。
+#[derive(Default)]
+struct QuakeTracker {
+    map: HashMap<String, QuakeEntry>,
+    order: VecDeque<String>,
+}
+
+impl QuakeTracker {
+    /// 発生時刻キーのエントリを取得（無ければ作成）する。
+    fn entry(&mut self, key: &str) -> &mut QuakeEntry {
+        if !self.map.contains_key(key) {
+            self.map.insert(key.to_string(), QuakeEntry::default());
+            self.order.push_back(key.to_string());
+            if self.order.len() > SEEN_ID_CAPACITY {
+                if let Some(old) = self.order.pop_front() {
+                    self.map.remove(&old);
+                }
+            }
+        }
+        self.map.get_mut(key).expect("直前に挿入済み")
+    }
+}
+
+/// 表示用 payload から内容シグネチャ（ハッシュ）を求める。表示フィールドが全て反映される。
+fn signature_of(payload: &serde_json::Value) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    payload.to_string().hash(&mut hasher);
+    hasher.finish()
+}
+
 /// 種別ごとの重複抑制状態。
 #[derive(Default)]
 struct DedupState {
@@ -66,6 +115,8 @@ struct DedupState {
     eews: SeenIds,
     /// 津波予報の id（同一発表の再送を除去）。
     tsunamis: SeenIds,
+    /// 地震情報(551)の投稿状態（速報・詳報を発生時刻ごとに保持）。
+    quakes: QuakeTracker,
 }
 
 #[tokio::main]
@@ -297,19 +348,23 @@ async fn handle_text(
     };
 
     match envelope.code {
-        CODE_JMA_QUAKE => handle_quake(config, http, text, is_test).await,
+        CODE_JMA_QUAKE => handle_quake(config, http, text, is_test, &mut dedup.quakes).await,
         CODE_EEW => handle_eew(config, http, text, is_test, &mut dedup.eews).await,
         CODE_TSUNAMI => handle_tsunami(config, http, text, is_test, &mut dedup.tsunamis).await,
         _ => Ok(()),
     }
 }
 
-/// 地震情報(551) を処理し、通知条件を満たせば確定情報を通知する。
+/// 地震情報(551) を処理し、通知条件を満たせば通知する。
+///
+/// 同一地震（発生時刻キー）について速報（震度速報）と詳報（各地の震度など）を別管理し、
+/// 内容が前回と同じなら投稿しない。内容が変わった場合は既存メッセージを差し替える（編集）。
 async fn handle_quake(
     config: &Config,
     http: &reqwest::Client,
     text: &str,
     is_test: bool,
+    tracker: &mut QuakeTracker,
 ) -> Result<()> {
     let quake: JmaQuake = serde_json::from_str(text)?;
     let eq = &quake.earthquake;
@@ -330,7 +385,10 @@ async fn handle_quake(
         return Ok(());
     }
 
+    let is_prompt = quake.issue.is_prompt();
+    let kind = if is_prompt { "震度速報" } else { "地震情報" };
     info!(
+        kind,
         max_scale = eq.max_scale,
         place = %eq.hypocenter.name,
         reason = %decision.reason,
@@ -362,8 +420,48 @@ async fn handle_quake(
     };
 
     let payload = discord::build_payload(&quake, &decision.reason, image.is_some(), is_test);
-    discord::send(http, &config.webhook_url, &payload, image).await?;
-    info!("Discord へ通知しました");
+    let signature = signature_of(&payload);
+    let key = eq.time.clone();
+
+    // 発生時刻が不明な場合は重複判定・差し替えができないため、そのまま新規投稿する。
+    if key.is_empty() {
+        discord::send(http, &config.webhook_url, &payload, image).await?;
+        info!(kind, "Discord へ通知しました（発生時刻不明のため重複判定なし）");
+        return Ok(());
+    }
+
+    // 速報・詳報それぞれのスロットを取り出す。
+    let entry = tracker.entry(&key);
+    let slot = if is_prompt {
+        &mut entry.prompt
+    } else {
+        &mut entry.detail
+    };
+
+    match slot {
+        // 内容に変更なし → 投稿しない。
+        Some(post) if post.signature == signature => {
+            info!(kind, "内容に変更がないため投稿をスキップ");
+        }
+        // 内容が変わった → 既存メッセージを差し替え（編集）。
+        Some(post) => {
+            discord::edit_message(http, &config.webhook_url, &post.message_id, &payload, image)
+                .await?;
+            post.signature = signature;
+            info!(kind, message_id = %post.message_id, "内容が変わったため差し替えました");
+        }
+        // 初報 → 新規投稿して message_id を記録する。
+        None => {
+            let message_id =
+                discord::post_message(http, &config.webhook_url, &payload, image).await?;
+            info!(kind, message_id = %message_id, "Discord へ通知しました");
+            *slot = Some(QuakePost {
+                signature,
+                message_id,
+            });
+        }
+    }
+
     Ok(())
 }
 
@@ -480,4 +578,79 @@ async fn handle_tsunami(
     discord::send(http, &config.webhook_url, &payload, None).await?;
     info!("津波予報を通知しました");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{Earthquake, Hypocenter, JmaQuake, QuakeIssue};
+
+    fn quake(issue_type: &str, max_scale: i32) -> JmaQuake {
+        JmaQuake {
+            code: 551,
+            issue: QuakeIssue {
+                issue_type: issue_type.to_string(),
+            },
+            earthquake: Earthquake {
+                time: "2026/06/28 05:21:00".to_string(),
+                max_scale,
+                hypocenter: Hypocenter::default(),
+                ..Default::default()
+            },
+            points: vec![],
+        }
+    }
+
+    fn payload(issue_type: &str, max_scale: i32, reason: &str) -> serde_json::Value {
+        discord::build_payload(&quake(issue_type, max_scale), reason, false, false)
+    }
+
+    #[test]
+    fn signature_same_for_identical_content() {
+        let a = payload("ScalePrompt", 45, "東北で最大震度5弱を観測");
+        let b = payload("ScalePrompt", 45, "東北で最大震度5弱を観測");
+        assert_eq!(signature_of(&a), signature_of(&b));
+    }
+
+    #[test]
+    fn signature_differs_when_scale_changes() {
+        let a = payload("ScalePrompt", 45, "東北で最大震度5弱を観測");
+        let b = payload("ScalePrompt", 50, "東北で最大震度5強を観測");
+        assert_ne!(signature_of(&a), signature_of(&b));
+    }
+
+    #[test]
+    fn signature_differs_between_prompt_and_detail() {
+        // 速報と詳報はタイトルが変わるためシグネチャも異なる（別管理の裏付け）。
+        let prompt = payload("ScalePrompt", 45, "東北で最大震度5弱を観測");
+        let detail = payload("DetailScale", 45, "東北で最大震度5弱を観測");
+        assert_ne!(signature_of(&prompt), signature_of(&detail));
+    }
+
+    #[test]
+    fn tracker_keeps_prompt_and_detail_separately() {
+        let mut tracker = QuakeTracker::default();
+        let key = "2026/06/28 05:21:00";
+        {
+            let entry = tracker.entry(key);
+            entry.prompt = Some(QuakePost {
+                signature: 1,
+                message_id: "p".to_string(),
+            });
+        }
+        let entry = tracker.entry(key);
+        assert!(entry.prompt.is_some());
+        assert!(entry.detail.is_none());
+    }
+
+    #[test]
+    fn tracker_evicts_oldest_over_capacity() {
+        let mut tracker = QuakeTracker::default();
+        for i in 0..(SEEN_ID_CAPACITY + 5) {
+            tracker.entry(&format!("key-{i}"));
+        }
+        assert_eq!(tracker.map.len(), SEEN_ID_CAPACITY);
+        // 最初に入れたキーは退避されている。
+        assert!(!tracker.map.contains_key("key-0"));
+    }
 }
