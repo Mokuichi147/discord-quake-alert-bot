@@ -5,6 +5,7 @@
 
 mod config;
 mod discord;
+mod geo;
 mod intensity;
 mod mapgen;
 mod model;
@@ -152,6 +153,9 @@ async fn main() -> Result<()> {
     if std::env::args().any(|a| a == "--test-eew") {
         return run_test_eew(&config, &http).await;
     }
+    if std::env::args().any(|a| a == "--test-prompt") {
+        return run_test_prompt(&config, &http).await;
+    }
     if std::env::args().any(|a| a == "--test") {
         return run_test(&config, &http).await;
     }
@@ -249,6 +253,60 @@ async fn run_test(config: &Config, http: &reqwest::Client) -> Result<()> {
     }
 
     warn!("直近の履歴に通知条件を満たす地震がありませんでした。しきい値を下げて再試行してください");
+    Ok(())
+}
+
+/// テスト用: 過去の地震情報から「震源未確定（震度速報など）」かつ観測県があり、
+/// 通知条件を満たす最新の1件を選び、本番と同じ経路 (handle_quake) で送信して終了する。
+///
+/// 通常の `--test` は最新の通知対象（多くは震源確定済みの詳報）を選ぶため、震源未確定時に
+/// 使う観測県マーカーマップの経路を確認できない。本コマンドはその経路を狙って検証する。
+async fn run_test_prompt(config: &Config, http: &reqwest::Client) -> Result<()> {
+    info!("テストモード: 過去の地震情報から震源未確定の報を取得します");
+    let body = http
+        .get(HISTORY_URL)
+        .send()
+        .await?
+        .error_for_status()?
+        .text()
+        .await?;
+    let items: Vec<serde_json::Value> = serde_json::from_str(&body)?;
+    info!(count = items.len(), "履歴を取得しました");
+
+    for item in &items {
+        let text = item.to_string();
+        let quake: JmaQuake = match serde_json::from_str(&text) {
+            Ok(q) => q,
+            Err(_) => continue,
+        };
+        // 震源座標が有効な報は震源マップ経路（=通常の --test で確認できる）なので除外。
+        if quake.earthquake.hypocenter.has_valid_coords() {
+            continue;
+        }
+        // 観測県マーカーが1つも作れない報も対象外。
+        if geo::points_to_markers(&quake.points).is_empty() {
+            continue;
+        }
+        let decision = decide(
+            &quake.earthquake,
+            &quake.points,
+            &config.region_min_scales,
+            config.other_min_scale,
+        );
+        if decision.notify {
+            info!(
+                max_scale = quake.earthquake.max_scale,
+                time = %quake.earthquake.time,
+                reason = %decision.reason,
+                "テスト送信する報（震源未確定）を選択しました"
+            );
+            handle_text(config, http, &text, true, &mut DedupState::default()).await?;
+            info!("テスト送信が完了しました");
+            return Ok(());
+        }
+    }
+
+    warn!("震源未確定で通知条件を満たす報が履歴にありませんでした。しきい値（OTHER_MIN_SCALE 等）を下げて再試行してください");
     Ok(())
 }
 
@@ -395,25 +453,42 @@ async fn handle_quake(
         "通知対象の地震を検出"
     );
 
-    // 地図画像（座標が有効かつ設定が有効な場合のみ）。
+    // 地図画像。震源座標が有効なら震源マップ、未確定（速報など）なら
+    // 観測した都道府県ごとのマーカーマップにフォールバックする。
     // staticmap のタイル取得は同期通信なので spawn_blocking 上で実行する。
-    let image = if config.attach_map && eq.hypocenter.has_valid_coords() {
-        let lat = eq.hypocenter.latitude;
-        let lon = eq.hypocenter.longitude;
-        let scale = eq.max_scale;
+    let image = if config.attach_map {
         let tile_tpl = config.tile_url_template.clone();
-
-        let result = tokio::task::spawn_blocking(move || {
-            mapgen::render_quake_map(lat, lon, scale, &tile_tpl)
-        })
-        .await?;
+        let result = if eq.hypocenter.has_valid_coords() {
+            let lat = eq.hypocenter.latitude;
+            let lon = eq.hypocenter.longitude;
+            let scale = eq.max_scale;
+            Some(
+                tokio::task::spawn_blocking(move || {
+                    mapgen::render_quake_map(lat, lon, scale, &tile_tpl)
+                })
+                .await?,
+            )
+        } else {
+            let markers = geo::points_to_markers(&quake.points);
+            if markers.is_empty() {
+                None
+            } else {
+                Some(
+                    tokio::task::spawn_blocking(move || {
+                        mapgen::render_markers_map(&markers, &tile_tpl)
+                    })
+                    .await?,
+                )
+            }
+        };
 
         match result {
-            Ok(bytes) => Some(bytes),
-            Err(e) => {
+            Some(Ok(bytes)) => Some(bytes),
+            Some(Err(e)) => {
                 warn!(error = %e, "地図画像の生成に失敗。テキストのみで通知します");
                 None
             }
+            None => None,
         }
     } else {
         None

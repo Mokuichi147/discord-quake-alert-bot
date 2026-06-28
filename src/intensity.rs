@@ -163,19 +163,22 @@ pub fn decide(
     region_min_scales: &HashMap<String, i32>,
     other_min_scale: i32,
 ) -> NotifyDecision {
-    let mut best: Option<(&str, i32)> = None;
+    // 地方しきい値を満たす地点のうち、最大の観測スケールを求める。
+    let mut best_scale: Option<i32> = None;
     for p in points {
         let region = region_of(&p.pref);
         let threshold = region_threshold(region, region_min_scales, other_min_scale);
-        if p.scale >= threshold && best.is_none_or(|(_, s)| p.scale > s) {
-            best = Some((region.unwrap_or("全国"), p.scale));
+        if p.scale >= threshold {
+            best_scale = Some(best_scale.map_or(p.scale, |s| s.max(p.scale)));
         }
     }
 
-    if let Some((label, scale)) = best {
+    if let Some(scale) = best_scale {
+        // 通知ポップアップでも場所が分かるよう、その最大震度を観測した都道府県名で示す。
+        let place = format_place(&prefs_at_scale(points, scale));
         return NotifyDecision {
             notify: true,
-            reason: format!("{label}で最大震度{}を観測", scale_label(scale)),
+            reason: format!("{place}で最大震度{}を観測", scale_label(scale)),
         };
     }
 
@@ -183,7 +186,7 @@ pub fn decide(
     if eq.max_scale >= other_min_scale {
         return NotifyDecision {
             notify: true,
-            reason: format!("全国で最大震度{}を観測", scale_label(eq.max_scale)),
+            reason: format!("最大震度{}を観測", scale_label(eq.max_scale)),
         };
     }
 
@@ -191,6 +194,31 @@ pub fn decide(
         notify: false,
         reason: String::new(),
     }
+}
+
+/// 指定スケールちょうどを観測した都道府県を、出現順・重複なしで返す。
+fn prefs_at_scale(points: &[Point], scale: i32) -> Vec<&str> {
+    let mut out: Vec<&str> = Vec::new();
+    for p in points {
+        if p.scale == scale && !p.pref.is_empty() && !out.contains(&p.pref.as_str()) {
+            out.push(p.pref.as_str());
+        }
+    }
+    out
+}
+
+/// 都道府県名の一覧を表示用にまとめる（最大4件、超過分は「など」に畳む）。
+fn format_place(prefs: &[&str]) -> String {
+    const MAX: usize = 4;
+    if prefs.is_empty() {
+        return "各地".to_string();
+    }
+    let shown = prefs.len().min(MAX);
+    let mut place = prefs[..shown].join("・");
+    if prefs.len() > shown {
+        place.push_str("など");
+    }
+    place
 }
 
 /// 緊急地震速報(556)の通知判定。`decide` の予想震度版。
@@ -268,7 +296,9 @@ mod tests {
         let points = vec![pt("東京都", 40), pt("大阪府", 30)];
         let d = decide(&eq, &points, &kanto40(), 50);
         assert!(d.notify);
-        assert!(d.reason.contains("関東"));
+        // 理由文は地方名ではなく観測した都道府県名で示す。
+        assert!(d.reason.contains("東京都"), "{}", d.reason);
+        assert!(d.reason.contains("最大震度4"), "{}", d.reason);
     }
 
     #[test]
@@ -310,9 +340,28 @@ mod tests {
         let scales = HashMap::from([("関東".to_string(), 40), ("東北".to_string(), 40)]);
         let d = decide(&eq, &[pt("宮城県", 40)], &scales, 50);
         assert!(d.notify);
-        assert!(d.reason.contains("東北"));
+        assert!(d.reason.contains("宮城県"), "{}", d.reason);
         // 東北を未設定にすると同じ震度4では通知しない（フォールバック50）
         assert!(!decide(&eq, &[pt("宮城県", 40)], &kanto40(), 50).notify);
+    }
+
+    #[test]
+    fn reason_lists_prefs_at_max_scale() {
+        let eq = Earthquake {
+            max_scale: 45,
+            ..Default::default()
+        };
+        let scales = HashMap::from([("東北".to_string(), 40)]);
+        // 最大震度5弱(45)を観測したのは青森県・岩手県。宮城県は震度3で対象外。
+        let points = vec![
+            pt("青森県", 45),
+            pt("岩手県", 45),
+            pt("岩手県", 40),
+            pt("宮城県", 30),
+        ];
+        let d = decide(&eq, &points, &scales, 50);
+        assert!(d.notify);
+        assert_eq!(d.reason, "青森県・岩手県で最大震度5弱を観測");
     }
 
     fn area(pref: &str, scale_to: i32) -> EewArea {

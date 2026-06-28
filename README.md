@@ -61,6 +61,7 @@ cargo test
 
 ```sh
 cargo run -- --test          # 地震情報(551) の確定通知をテスト送信
+cargo run -- --test-prompt   # 震源未確定の報（観測県マーカーマップ）をテスト送信
 cargo run -- --test-eew      # 緊急地震速報(556) の速報通知をテスト送信
 cargo run -- --test-tsunami  # 津波予報(552) の通知をテスト送信（履歴に津波予報がある場合）
 ```
