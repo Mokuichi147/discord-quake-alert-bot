@@ -15,9 +15,11 @@ const MAP_FILE_NAME: &str = "quake.webp";
 ///
 /// `with_image` が true の場合、地図画像を `attachment://` で参照する。
 /// `is_test` が true の場合、テスト送信であることをタイトルとフッターに明示する。
+/// `quake.issue` の種別で速報（震度速報）と詳報（各地の震度など）をタイトルで区別する。
 pub fn build_payload(quake: &JmaQuake, reason: &str, with_image: bool, is_test: bool) -> Value {
     let eq = &quake.earthquake;
     let hypo = &eq.hypocenter;
+    let is_prompt = quake.issue.is_prompt();
 
     let place = if hypo.name.is_empty() {
         "不明".to_string()
@@ -40,16 +42,25 @@ pub fn build_payload(quake: &JmaQuake, reason: &str, with_image: bool, is_test: 
     } else {
         ""
     };
+    // 速報（震度速報）と詳報（各地の震度など）でタイトルの種別名を変える。
+    let kind = if is_prompt { "震度速報" } else { "地震情報" };
     let title = if is_test {
         format!(
-            "🧪【テスト通知】{tsunami_mark}地震情報（最大震度 {}）",
+            "🧪【テスト通知】{tsunami_mark}{kind}（最大震度 {}）",
             scale_label(eq.max_scale)
         )
     } else {
         format!(
-            "🚨{tsunami_mark} 地震情報（最大震度 {}）",
+            "🚨{tsunami_mark} {kind}（最大震度 {}）",
             scale_label(eq.max_scale)
         )
+    };
+
+    // 速報は震源等が未確定のため、続報で詳細が入る旨を理由文に補足する。
+    let description = if is_prompt {
+        format!("{reason}（速報のため続報で震源・規模などの詳細が入ります）")
+    } else {
+        reason.to_string()
     };
 
     // 出典表示。元データは気象庁（CC BY 4.0）。地図添付時は地理院タイルも明記する。
@@ -63,7 +74,7 @@ pub fn build_payload(quake: &JmaQuake, reason: &str, with_image: bool, is_test: 
 
     let mut embed = json!({
         "title": title,
-        "description": reason,
+        "description": description,
         "color": embed_color(eq.max_scale),
         "fields": [
             { "name": "震源地", "value": place, "inline": true },
@@ -134,7 +145,7 @@ pub fn build_eew_payload(eew: &Eew, reason: &str, with_image: bool, is_test: boo
 
     // 予想震度が高い順に対象地域名を列挙（最大8件）。
     let mut areas: Vec<_> = eew.areas.iter().collect();
-    areas.sort_by(|a, b| b.scale_to.cmp(&a.scale_to));
+    areas.sort_by_key(|a| std::cmp::Reverse(a.scale_to));
     let area_text = if areas.is_empty() {
         "—".to_string()
     } else {
@@ -246,41 +257,100 @@ pub fn build_tsunami_payload(tsunami: &Tsunami, is_test: bool) -> Value {
     json!({ "embeds": [embed] })
 }
 
+/// `payload` と任意の `image` から、JSON または multipart のリクエストを組み立てる。
+///
+/// `image` がある場合は multipart で画像を `files[0]` に添付する。payload に
+/// `attachments` 等の添付制御フィールドが含まれていればそのまま送られる。
+fn build_request(
+    builder: reqwest::RequestBuilder,
+    payload: &Value,
+    image: Option<Vec<u8>>,
+) -> Result<reqwest::RequestBuilder> {
+    if let Some(bytes) = image {
+        let part = reqwest::multipart::Part::bytes(bytes)
+            .file_name(MAP_FILE_NAME)
+            .mime_str("image/webp")?;
+        let form = reqwest::multipart::Form::new()
+            .text("payload_json", serde_json::to_string(payload)?)
+            .part("files[0]", part);
+        Ok(builder.multipart(form))
+    } else {
+        Ok(builder.json(payload))
+    }
+}
+
+/// レスポンスのステータスを検証し、成功時のみ本文を返す。
+async fn check_response(response: reqwest::Response) -> Result<String> {
+    let status = response.status();
+    let body = response.text().await.unwrap_or_default();
+    if !status.is_success() {
+        anyhow::bail!("Webhook がエラー応答: {status} {body}");
+    }
+    Ok(body)
+}
+
 /// Webhook に送信する。`image` がある場合は multipart で画像を添付する。
+///
+/// message_id を必要としない通知（緊急地震速報・津波予報）向け。
 pub async fn send(
     client: &reqwest::Client,
     webhook_url: &str,
     payload: &Value,
     image: Option<Vec<u8>>,
 ) -> Result<()> {
-    let response = if let Some(bytes) = image {
-        let part = reqwest::multipart::Part::bytes(bytes)
-            .file_name(MAP_FILE_NAME)
-            .mime_str("image/webp")?;
+    let request = build_request(client.post(webhook_url), payload, image)?;
+    let response = request.send().await.context("Webhook 送信に失敗")?;
+    check_response(response).await?;
+    Ok(())
+}
 
-        let form = reqwest::multipart::Form::new()
-            .text("payload_json", serde_json::to_string(payload)?)
-            .part("files[0]", part);
+/// Webhook に新規投稿し、作成されたメッセージの ID を返す。
+///
+/// 後で編集（差し替え）できるよう `?wait=true` を付けてレスポンスから ID を取得する。
+pub async fn post_message(
+    client: &reqwest::Client,
+    webhook_url: &str,
+    payload: &Value,
+    image: Option<Vec<u8>>,
+) -> Result<String> {
+    let url = format!("{webhook_url}?wait=true");
+    let request = build_request(client.post(&url), payload, image)?;
+    let response = request.send().await.context("Webhook 投稿に失敗")?;
+    let body = check_response(response).await?;
+    let value: Value = serde_json::from_str(&body).context("Webhook 応答の解析に失敗")?;
+    value
+        .get("id")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .context("Webhook 応答に message id がありません")
+}
 
-        client
-            .post(webhook_url)
-            .multipart(form)
-            .send()
-            .await
-            .context("Webhook(multipart)送信に失敗")?
+/// 既存の Webhook メッセージを編集（差し替え）する。
+///
+/// 画像ありの場合は `files[0]` を再アップロードし、`attachments` で旧添付を置き換える。
+/// 画像なしの場合は `attachments` を空配列にして旧添付を取り除く。
+pub async fn edit_message(
+    client: &reqwest::Client,
+    webhook_url: &str,
+    message_id: &str,
+    payload: &Value,
+    image: Option<Vec<u8>>,
+) -> Result<()> {
+    let url = format!("{webhook_url}/messages/{message_id}");
+
+    // 添付の置き換え指示を payload に付与する。
+    let mut payload = payload.clone();
+    let attachments = if image.is_some() {
+        json!([{ "id": 0, "filename": MAP_FILE_NAME }])
     } else {
-        client
-            .post(webhook_url)
-            .json(payload)
-            .send()
-            .await
-            .context("Webhook(json)送信に失敗")?
+        json!([])
     };
-
-    let status = response.status();
-    if !status.is_success() {
-        let body = response.text().await.unwrap_or_default();
-        anyhow::bail!("Webhook がエラー応答: {status} {body}");
+    if let Some(obj) = payload.as_object_mut() {
+        obj.insert("attachments".to_string(), attachments);
     }
+
+    let request = build_request(client.patch(&url), &payload, image)?;
+    let response = request.send().await.context("Webhook 編集に失敗")?;
+    check_response(response).await?;
     Ok(())
 }

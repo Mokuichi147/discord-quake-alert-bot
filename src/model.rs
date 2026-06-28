@@ -17,9 +17,26 @@ pub struct Envelope {
 pub struct JmaQuake {
     pub code: i32,
     #[serde(default)]
+    pub issue: QuakeIssue,
+    #[serde(default)]
     pub earthquake: Earthquake,
     #[serde(default)]
     pub points: Vec<Point>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct QuakeIssue {
+    /// 報の種別。"ScalePrompt"=震度速報, "Destination"=震源, "ScaleAndDestination",
+    /// "DetailScale"=各地の震度, "Foreign"=遠地, "Other"。
+    #[serde(rename = "type", default)]
+    pub issue_type: String,
+}
+
+impl QuakeIssue {
+    /// 震度速報（速報）か。それ以外（各地の震度など）は詳報として扱う。
+    pub fn is_prompt(&self) -> bool {
+        self.issue_type == "ScalePrompt"
+    }
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -200,5 +217,29 @@ impl Hypocenter {
         (-90.0..=90.0).contains(&self.latitude)
             && (-180.0..=180.0).contains(&self.longitude)
             && !(self.latitude == 0.0 && self.longitude == 0.0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn issue(issue_type: &str) -> QuakeIssue {
+        QuakeIssue {
+            issue_type: issue_type.to_string(),
+        }
+    }
+
+    #[test]
+    fn scale_prompt_is_prompt() {
+        assert!(issue("ScalePrompt").is_prompt());
+    }
+
+    #[test]
+    fn other_types_are_detail() {
+        // 各地の震度・震源情報などは詳報として扱う。
+        for t in ["DetailScale", "ScaleAndDestination", "Destination", "Foreign", "Other", ""] {
+            assert!(!issue(t).is_prompt(), "{t} は詳報扱いのはず");
+        }
     }
 }
