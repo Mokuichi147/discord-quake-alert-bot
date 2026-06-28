@@ -7,7 +7,7 @@ use crate::intensity::{
     embed_color, eew_max_scale, has_tsunami, scale_label, tsunami_grade_color, tsunami_grade_label,
     tsunami_grade_rank, tsunami_label,
 };
-use crate::model::{Eew, JmaQuake, Tsunami};
+use crate::model::{Eew, JmaQuake, Point, Tsunami};
 
 const MAP_FILE_NAME: &str = "quake.webp";
 
@@ -72,17 +72,30 @@ pub fn build_payload(quake: &JmaQuake, reason: &str, with_image: bool, is_test: 
         footer.push_str(" ・ これはテスト送信です");
     }
 
+    let mut fields = vec![
+        json!({ "name": "震源地", "value": place, "inline": true }),
+        json!({ "name": "マグニチュード", "value": magnitude, "inline": true }),
+        json!({ "name": "深さ", "value": depth, "inline": true }),
+        json!({ "name": "発生時刻", "value": time, "inline": false }),
+    ];
+
+    // 各地の観測震度がある場合は、震度の高い順に都道府県をまとめて表示する。
+    // 震源が未確定な速報段階でも「どこで何の震度を観測したか」を具体的に伝える。
+    if let Some(points_text) = fmt_points(&quake.points) {
+        fields.push(json!({ "name": "各地の震度", "value": points_text, "inline": false }));
+    }
+
+    fields.push(json!({
+        "name": "津波",
+        "value": tsunami_label(&eq.domestic_tsunami),
+        "inline": false,
+    }));
+
     let mut embed = json!({
         "title": title,
         "description": description,
         "color": embed_color(eq.max_scale),
-        "fields": [
-            { "name": "震源地", "value": place, "inline": true },
-            { "name": "マグニチュード", "value": magnitude, "inline": true },
-            { "name": "深さ", "value": depth, "inline": true },
-            { "name": "発生時刻", "value": time, "inline": false },
-            { "name": "津波", "value": tsunami_label(&eq.domestic_tsunami), "inline": false },
-        ],
+        "fields": fields,
         "footer": { "text": footer },
     });
 
@@ -91,6 +104,49 @@ pub fn build_payload(quake: &JmaQuake, reason: &str, with_image: bool, is_test: 
     }
 
     json!({ "embeds": [embed] })
+}
+
+/// 1つの震度欄に並べる都道府県の上限。超過分は「ほかN県」に畳む。
+const MAX_PREFS_PER_SCALE: usize = 12;
+
+/// 観測点(`points`)を震度の高い順にまとめ、各震度ごとに観測した都道府県を列挙する。
+///
+/// 観測震度のある点が1つも無ければ `None`（フィールドを出さない）。
+/// 同一震度の都道府県は出現順で重複を除き、`MAX_PREFS_PER_SCALE` を超えたら畳む。
+fn fmt_points(points: &[Point]) -> Option<String> {
+    use std::collections::BTreeMap;
+
+    // scale -> 都道府県（出現順・重複なし）。BTreeMap でキー昇順に整列する。
+    let mut by_scale: BTreeMap<i32, Vec<String>> = BTreeMap::new();
+    for p in points {
+        if p.scale < 0 || p.pref.is_empty() {
+            continue;
+        }
+        let prefs = by_scale.entry(p.scale).or_default();
+        if !prefs.iter().any(|x| x == &p.pref) {
+            prefs.push(p.pref.clone());
+        }
+    }
+
+    if by_scale.is_empty() {
+        return None;
+    }
+
+    // 震度の高い順に「震度X: 県、県…」の行を作る。
+    let lines: Vec<String> = by_scale
+        .iter()
+        .rev()
+        .map(|(scale, prefs)| {
+            let shown = prefs.len().min(MAX_PREFS_PER_SCALE);
+            let mut joined = prefs[..shown].join("、");
+            if prefs.len() > shown {
+                joined.push_str(&format!(" ほか{}県", prefs.len() - shown));
+            }
+            format!("震度{}: {}", scale_label(*scale), joined)
+        })
+        .collect();
+
+    Some(lines.join("\n"))
 }
 
 /// マグニチュード表記（不明は -1 未満で判定）。
@@ -353,4 +409,45 @@ pub async fn edit_message(
     let response = request.send().await.context("Webhook 編集に失敗")?;
     check_response(response).await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pt(pref: &str, scale: i32) -> Point {
+        Point {
+            pref: pref.to_string(),
+            addr: String::new(),
+            scale,
+        }
+    }
+
+    #[test]
+    fn points_grouped_by_scale_desc() {
+        let points = vec![
+            pt("宮城県", 45),
+            pt("福島県", 40),
+            pt("宮城県", 45), // 重複は畳む
+            pt("岩手県", 40),
+        ];
+        let text = fmt_points(&points).expect("観測点があるので Some");
+        assert_eq!(text, "震度5弱: 宮城県\n震度4: 福島県、岩手県");
+    }
+
+    #[test]
+    fn points_empty_returns_none() {
+        assert!(fmt_points(&[]).is_none());
+        // 震度不明(-1)や県名なしは対象外。
+        assert!(fmt_points(&[pt("", 45), pt("宮城県", -1)]).is_none());
+    }
+
+    #[test]
+    fn points_over_limit_are_folded() {
+        let points: Vec<Point> = (0..MAX_PREFS_PER_SCALE + 3)
+            .map(|i| pt(&format!("県{i}"), 40))
+            .collect();
+        let text = fmt_points(&points).unwrap();
+        assert!(text.contains("ほか3県"), "超過分が畳まれる: {text}");
+    }
 }
