@@ -584,24 +584,37 @@ async fn handle_eew(
         "緊急地震速報を検出"
     );
 
-    // 地図画像（座標が有効かつ設定が有効な場合のみ）。
-    let image = if config.attach_map && eew.earthquake.hypocenter.has_valid_coords() {
-        let lat = eew.earthquake.hypocenter.latitude;
-        let lon = eew.earthquake.hypocenter.longitude;
-        let scale = eew_max_scale(&eew.areas);
+    // 地図画像。震源座標が有効なら震源＋対象地域マーカーの地図、未確定なら
+    // 対象地域マーカーのみの地図にフォールバックする（551 と同じ方針）。
+    let image = if config.attach_map {
         let tile_tpl = config.tile_url_template.clone();
-
-        let result = tokio::task::spawn_blocking(move || {
-            mapgen::render_quake_map(lat, lon, scale, &tile_tpl)
-        })
-        .await?;
+        let markers = geo::eew_areas_to_markers(&eew.areas);
+        let result = if eew.earthquake.hypocenter.has_valid_coords() {
+            let lat = eew.earthquake.hypocenter.latitude;
+            let lon = eew.earthquake.hypocenter.longitude;
+            let scale = eew_max_scale(&eew.areas);
+            Some(
+                tokio::task::spawn_blocking(move || {
+                    mapgen::render_quake_map_with_points(lat, lon, scale, &markers, &tile_tpl)
+                })
+                .await?,
+            )
+        } else if markers.is_empty() {
+            None
+        } else {
+            Some(
+                tokio::task::spawn_blocking(move || mapgen::render_markers_map(&markers, &tile_tpl))
+                    .await?,
+            )
+        };
 
         match result {
-            Ok(bytes) => Some(bytes),
-            Err(e) => {
+            Some(Ok(bytes)) => Some(bytes),
+            Some(Err(e)) => {
                 warn!(error = %e, "地図画像の生成に失敗。テキストのみで通知します");
                 None
             }
+            None => None,
         }
     } else {
         None

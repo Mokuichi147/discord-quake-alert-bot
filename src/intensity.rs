@@ -224,7 +224,7 @@ fn eew_prefs_at_scale(areas: &[EewArea], scale: i32) -> Vec<String> {
 
 /// 556 の接尾辞なし都府県名（例: "神奈川"）に、551 と同じ表示形（例: "神奈川県"）の
 /// 接尾辞を補う。
-fn display_pref(pref: &str) -> String {
+pub fn display_pref(pref: &str) -> String {
     let np = normalize_pref(pref);
     match np {
         "北海道" => np.to_string(),

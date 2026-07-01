@@ -1,6 +1,6 @@
 # 地震bot
 
-[P2P地震情報 JSON API v2](https://www.p2pquake.net/develop/json_api_v2/) の WebSocket を購読し、日本国内で強い揺れの地震が発生したときに、震源地・マグニチュード・震度を **Discord Webhook** へ通知します。座標が判明している場合は震源地をプロットした地図画像も添付します。
+[P2P地震情報 JSON API v2](https://www.p2pquake.net/develop/json_api_v2/) の WebSocket を購読し、日本国内で強い揺れの地震が発生したときに、震源地・マグニチュード・震度を **Discord Webhook** へ通知します。座標が判明している場合は震源地・各地の震度（緊急地震速報は予想震度）をプロットした地図画像も添付します。
 
 **速報と確定の2段構え（hybrid）** で通知します。
 

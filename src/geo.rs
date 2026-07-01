@@ -9,7 +9,8 @@
 use std::collections::HashMap;
 use std::sync::OnceLock;
 
-use crate::model::Point;
+use crate::intensity::display_pref;
+use crate::model::{EewArea, Point};
 
 /// 観測点名 → (緯度, 経度) の座標データ（タブ区切り: 名前\t緯度\t経度）。
 ///
@@ -131,6 +132,39 @@ pub fn points_to_markers(points: &[Point]) -> Vec<(f64, f64, i32)> {
     markers
 }
 
+/// 緊急地震速報(556)の対象地域を地図に描く `(緯度, 経度, 予想震度スケール)` の一覧へ変換する。
+///
+/// `points_to_markers` の 556 版。`areas.name`（地域名。例: "神奈川県西部"）が観測点座標
+/// テーブルに一致すればその座標を使うが、556 の地域名は市区町村単位ではないため通常は
+/// 一致せず、都道府県の代表座標へフォールバックする（同一県は最大予想震度を採用）。
+pub fn eew_areas_to_markers(areas: &[EewArea]) -> Vec<(f64, f64, i32)> {
+    let mut markers: Vec<(f64, f64, i32)> = Vec::new();
+    let mut fallback_max_by_pref: HashMap<String, i32> = HashMap::new();
+
+    for a in areas {
+        if a.scale_to < 0 || a.pref.is_empty() {
+            continue;
+        }
+        if let Some((lat, lon)) = observation_point_coord(&a.name) {
+            markers.push((lat, lon, a.scale_to));
+            continue;
+        }
+        let pref = display_pref(&a.pref);
+        let entry = fallback_max_by_pref.entry(pref).or_insert(a.scale_to);
+        if a.scale_to > *entry {
+            *entry = a.scale_to;
+        }
+    }
+
+    markers.extend(
+        fallback_max_by_pref
+            .into_iter()
+            .filter_map(|(pref, scale)| pref_coord(&pref).map(|(lat, lon)| (lat, lon, scale))),
+    );
+
+    markers
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -201,5 +235,41 @@ mod tests {
     fn markers_skip_unknown_pref_and_invalid_scale() {
         let points = vec![pt("ハワイ", 50), pt("宮城県", -1)];
         assert!(points_to_markers(&points).is_empty());
+    }
+
+    fn area(pref: &str, name: &str, scale_to: i32) -> EewArea {
+        EewArea {
+            pref: pref.to_string(),
+            name: name.to_string(),
+            scale_from: scale_to,
+            scale_to,
+        }
+    }
+
+    #[test]
+    fn eew_markers_fall_back_to_pref_representative_coord() {
+        // 556 の地域名（例: "神奈川県西部"）は市区町村単位ではないため、
+        // 通常は観測点座標テーブルに一致せず県代表座標に集約される。
+        let areas = vec![area("神奈川", "神奈川県西部", 45), area("神奈川", "神奈川県東部", 40)];
+        let markers = eew_areas_to_markers(&areas);
+        assert_eq!(markers.len(), 1);
+        assert_eq!((markers[0].0, markers[0].1), pref_coord("神奈川県").unwrap());
+        assert_eq!(markers[0].2, 45); // 最大予想震度を採用
+    }
+
+    #[test]
+    fn eew_markers_take_max_scale_per_pref() {
+        let areas = vec![area("神奈川", "神奈川県西部", 40), area("大阪", "大阪府北部", 30)];
+        let mut markers = eew_areas_to_markers(&areas);
+        markers.sort_by_key(|m| m.2);
+        assert_eq!(markers.len(), 2);
+        assert_eq!(markers[0].2, 30);
+        assert_eq!(markers[1].2, 40);
+    }
+
+    #[test]
+    fn eew_markers_skip_invalid_scale() {
+        let areas = vec![area("神奈川", "神奈川県西部", -1)];
+        assert!(eew_areas_to_markers(&areas).is_empty());
     }
 }
