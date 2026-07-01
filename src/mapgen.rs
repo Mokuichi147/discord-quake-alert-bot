@@ -1,6 +1,7 @@
-//! 震源地をプロットした地図画像(WebP)の生成。
+//! 震源地・各地の震度をプロットした地図画像(WebP)の生成。
 //!
-//! staticmap クレートで地図タイル(既定は国土地理院の白地図)を取得し、震源地に二重円マーカーを描く。
+//! staticmap クレートで地図タイル(既定は国土地理院の白地図)を取得し、震源地（黒縁）と
+//! 各観測地点（白縁、震度に応じた色）に二重円マーカーを描く。
 //! staticmap は PNG しか出力できないため、生成後に WebP へ再エンコードして軽量化する。
 
 use std::f64::consts::PI;
@@ -76,6 +77,58 @@ pub fn render_quake_map(
     encode_webp(&png)
 }
 
+/// 震源地と各地の震度をまとめてプロットした地図 WebP を生成し、バイト列で返す。
+///
+/// `markers` は `(緯度, 経度, 震度スケール)` の観測地点一覧。震源には黒縁の、
+/// 各観測地点には白縁の震度色マーカーを描き、見た目で区別できるようにする。
+/// 震源と全マーカーが収まるよう中心とズームを自動計算する（`render_markers_map` と同様）。
+/// `markers` が空の場合は `render_quake_map` と同じ震源のみの地図になる。
+pub fn render_quake_map_with_points(
+    lat: f64,
+    lon: f64,
+    scale: i32,
+    markers: &[(f64, f64, i32)],
+    tile_url_template: &str,
+) -> Result<Vec<u8>> {
+    if markers.is_empty() {
+        return render_quake_map(lat, lon, scale, tile_url_template);
+    }
+
+    let lat_min = markers.iter().map(|m| m.0).fold(lat, f64::min);
+    let lat_max = markers.iter().map(|m| m.0).fold(lat, f64::max);
+    let lon_min = markers.iter().map(|m| m.1).fold(lon, f64::min);
+    let lon_max = markers.iter().map(|m| m.1).fold(lon, f64::max);
+
+    let zoom = fit_zoom(lat_min, lat_max, lon_min, lon_max);
+    let mut map = StaticMapBuilder::new()
+        .width(MAP_WIDTH)
+        .height(MAP_HEIGHT)
+        .zoom(zoom)
+        .lat_center((lat_min + lat_max) / 2.0)
+        .lon_center((lon_min + lon_max) / 2.0)
+        .url_template(tile_url_template)
+        .build()?;
+
+    // 震度の弱い順に観測地点マーカーを描き、強い揺れが手前(上)に来るようにする。
+    // 地点数が多い詳報では市区町村単位で密集するため、半径を絞って重なりを抑える。
+    let (outline_r, inner_r) = marker_radii(markers.len());
+    let mut ordered: Vec<&(f64, f64, i32)> = markers.iter().collect();
+    ordered.sort_by_key(|m| m.2);
+    for &(m_lat, m_lon, m_scale) in ordered {
+        let (outline, inner) = marker_pair(m_lat, m_lon, m_scale, outline_r, inner_r)?;
+        map.add_tool(outline);
+        map.add_tool(inner);
+    }
+
+    // 震源地は最後に描き、黒縁の二重円で観測地点マーカーと区別する。
+    let (epi_outline, epi_inner) = epicenter_marker_pair(lat, lon, scale)?;
+    map.add_tool(epi_outline);
+    map.add_tool(epi_inner);
+
+    let png = map.encode_png()?;
+    encode_webp(&png)
+}
+
 /// 震源不明時のフォールバック地図。観測した都道府県ごとのマーカーを描いた WebP を返す。
 ///
 /// `markers` は `(緯度, 経度, 震度スケール)` の一覧。全マーカーが収まるよう中心とズームを
@@ -102,10 +155,12 @@ pub fn render_markers_map(markers: &[(f64, f64, i32)], tile_url_template: &str) 
         .build()?;
 
     // 震度の弱い順に追加し、強い揺れのマーカーが手前(上)に来るようにする。
+    // 地点数が多い詳報では市区町村単位で密集するため、半径を絞って重なりを抑える。
+    let (outline_r, inner_r) = marker_radii(markers.len());
     let mut ordered: Vec<&(f64, f64, i32)> = markers.iter().collect();
     ordered.sort_by_key(|m| m.2);
     for &(lat, lon, scale) in ordered {
-        let (outline, inner) = marker_pair(lat, lon, scale)?;
+        let (outline, inner) = marker_pair(lat, lon, scale, outline_r, inner_r)?;
         map.add_tool(outline);
         map.add_tool(inner);
     }
@@ -114,20 +169,57 @@ pub fn render_markers_map(markers: &[(f64, f64, i32)], tile_url_template: &str) 
     encode_webp(&png)
 }
 
+/// 観測地点マーカーの半径(px)を `(縁, 中心)` で返す。
+///
+/// 詳報では市区町村単位で数百件の観測点が密集しうるため、地点数が多いほど
+/// 半径を絞り、重なり合って判読しづらくなるのを防ぐ。
+fn marker_radii(count: usize) -> (f32, f32) {
+    match count {
+        0..=15 => (11.0, 8.0),
+        16..=60 => (7.0, 5.0),
+        61..=200 => (5.0, 3.5),
+        _ => (3.5, 2.5),
+    }
+}
+
 /// 震度色の二重円マーカー（白縁＋中心円）を作る。
-fn marker_pair(lat: f64, lon: f64, scale: i32) -> Result<(Circle, Circle)> {
+fn marker_pair(
+    lat: f64,
+    lon: f64,
+    scale: i32,
+    outline_radius: f32,
+    inner_radius: f32,
+) -> Result<(Circle, Circle)> {
     let (r, g, b) = marker_rgb(scale);
     let outline = CircleBuilder::new()
         .lon_coordinate(lon)
         .lat_coordinate(lat)
         .color(Color::new(true, 255, 255, 255, 255))
-        .radius(11.0)
+        .radius(outline_radius)
         .build()?;
     let inner = CircleBuilder::new()
         .lon_coordinate(lon)
         .lat_coordinate(lat)
         .color(Color::new(true, r, g, b, 255))
-        .radius(8.0)
+        .radius(inner_radius)
+        .build()?;
+    Ok((outline, inner))
+}
+
+/// 震源色の二重円マーカー（黒縁＋中心円）を作る。観測地点マーカー（白縁）と区別するため使う。
+fn epicenter_marker_pair(lat: f64, lon: f64, scale: i32) -> Result<(Circle, Circle)> {
+    let (r, g, b) = marker_rgb(scale);
+    let outline = CircleBuilder::new()
+        .lon_coordinate(lon)
+        .lat_coordinate(lat)
+        .color(Color::new(true, 0, 0, 0, 255))
+        .radius(14.0)
+        .build()?;
+    let inner = CircleBuilder::new()
+        .lon_coordinate(lon)
+        .lat_coordinate(lat)
+        .color(Color::new(true, r, g, b, 255))
+        .radius(10.0)
         .build()?;
     Ok((outline, inner))
 }
