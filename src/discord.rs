@@ -150,11 +150,21 @@ fn fmt_intensity_groups(items: &[(&str, i32)], unit: &str) -> Option<String> {
     Some(lines.join("\n"))
 }
 
-/// 観測点(`points`)を震度の高い順にまとめ、各震度ごとに観測した都道府県を列挙する。
-/// 観測震度のある点が1つも無ければ `None`（フィールドを出さない）。
+/// 観測点(`points`)を震度の高い順にまとめ、各震度ごとに観測した地点名（市区町村等）を列挙する。
+/// `addr` が空の場合は都道府県名で代用する。観測震度のある点が1つも無ければ `None`（フィールドを出さない）。
 fn fmt_points(points: &[Point]) -> Option<String> {
-    let items: Vec<(&str, i32)> = points.iter().map(|p| (p.pref.as_str(), p.scale)).collect();
-    fmt_intensity_groups(&items, "県")
+    let items: Vec<(&str, i32)> = points
+        .iter()
+        .map(|p| {
+            let name = if p.addr.is_empty() {
+                p.pref.as_str()
+            } else {
+                p.addr.as_str()
+            };
+            (name, p.scale)
+        })
+        .collect();
+    fmt_intensity_groups(&items, "地点")
 }
 
 /// マグニチュード表記（不明は -1 未満で判定）。
@@ -414,10 +424,10 @@ pub async fn edit_message(
 mod tests {
     use super::*;
 
-    fn pt(pref: &str, scale: i32) -> Point {
+    fn pt(pref: &str, addr: &str, scale: i32) -> Point {
         Point {
             pref: pref.to_string(),
-            addr: String::new(),
+            addr: addr.to_string(),
             scale,
         }
     }
@@ -425,29 +435,36 @@ mod tests {
     #[test]
     fn points_grouped_by_scale_desc() {
         let points = vec![
-            pt("宮城県", 45),
-            pt("福島県", 40),
-            pt("宮城県", 45), // 重複は畳む
-            pt("岩手県", 40),
+            pt("宮城県", "宮城県北部", 45),
+            pt("福島県", "福島県中通り", 40),
+            pt("宮城県", "宮城県北部", 45), // 重複は畳む
+            pt("岩手県", "岩手県沿岸南部", 40),
         ];
         let text = fmt_points(&points).expect("観測点があるので Some");
-        assert_eq!(text, "5弱: 宮城県\n4: 福島県、岩手県");
+        assert_eq!(text, "5弱: 宮城県北部\n4: 福島県中通り、岩手県沿岸南部");
+    }
+
+    #[test]
+    fn points_falls_back_to_pref_when_addr_empty() {
+        let points = vec![pt("青森県", "", 40), pt("岩手県", "", 40)];
+        let text = fmt_points(&points).expect("観測点があるので Some");
+        assert_eq!(text, "4: 青森県、岩手県");
     }
 
     #[test]
     fn points_empty_returns_none() {
         assert!(fmt_points(&[]).is_none());
-        // 震度不明(-1)や県名なしは対象外。
-        assert!(fmt_points(&[pt("", 45), pt("宮城県", -1)]).is_none());
+        // 震度不明(-1)や地点名なしは対象外。
+        assert!(fmt_points(&[pt("", "", 45), pt("宮城県", "宮城県北部", -1)]).is_none());
     }
 
     #[test]
     fn points_over_limit_are_folded() {
         let points: Vec<Point> = (0..MAX_NAMES_PER_SCALE + 3)
-            .map(|i| pt(&format!("県{i}"), 40))
+            .map(|i| pt(&format!("県{i}"), &format!("地点{i}"), 40))
             .collect();
         let text = fmt_points(&points).unwrap();
-        assert!(text.contains("ほか3県"), "超過分が畳まれる: {text}");
+        assert!(text.contains("ほか3地点"), "超過分が畳まれる: {text}");
     }
 
     #[test]
