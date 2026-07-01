@@ -91,7 +91,7 @@ src/
   geo.rs        … 観測点(市区町村)・都道府県の座標テーブルとマーカー変換
   mapgen.rs     … 震源地・各地の震度をプロットした地図WebPの生成(staticmap、既定は地理院タイル)
   discord.rs    … Discord embed の組み立てと Webhook 送信(multipart)
-  data/observation_points.tsv … 観測点名→座標のデータ（気象庁公表データを基に集約、CC BY 4.0）
+  data/observation_points.tsv … 気象庁自身の観測点名→座標のデータ（気象庁震度観測点一覧表より抽出、CC BY 4.0）
 ```
 
 ## 動作の概要
@@ -110,6 +110,7 @@ src/
 - **地図タイルの利用規約**: 既定は国土地理院の白地図(blank、日本全国・zoom 5〜14)タイルです。利用にあたっては出典「地理院タイル」の表示が必要で、本botは地図添付時に通知へ出典と[地理院タイル一覧ページ](https://maps.gsi.go.jp/development/ichiran.html)へのリンクを明記します。高頻度・大量利用の場合は[地理院タイルの利用規約](https://maps.gsi.go.jp/development/ichiran.html)を確認してください。OpenStreetMap など別のタイルへ差し替える場合は `TILE_URL_TEMPLATE` に `{z}/{x}/{y}` 形式の URL を設定します（例: `https://tile.openstreetmap.org/{z}/{x}/{y}.png`。OSM 公式タイルは[利用ポリシー](https://operations.osmfoundation.org/policies/tiles/)に注意）。
 - P2P地震情報は気象庁発表をもとにした第三者サービスです。緊急地震速報（予報・警報）そのものではなく、揺れの「予想/観測」情報を扱います。重大用途には公式情報源も併用してください。
 - 震源座標が不明な情報（`latitude`/`longitude` が無効値）では地図を添付せずテキストのみで通知します。
+- **各地の震度マーカーの精度**: 地図上の観測地点マーカーは、地点名が気象庁自身の観測点（[気象庁震度観測点一覧表](https://www.data.jma.go.jp/eqev/data/kyoshin/jma-shindo.html)、CC BY 4.0）に一致する場合のみ市区町村単位の正確な座標に描画されます。実際の観測地点の多くは都道府県・市区町村や防災科学技術研究所(NIED)が運用するもので、これらの座標データは配布元の利用規約（NIEDは再配布を禁止）により本botには含めていないため、該当地点は都道府県の代表座標にまとめて表示されます（実データでの一致率はおおよそ2割程度）。
 
 ## 常時稼働
 
