@@ -1,6 +1,6 @@
 [package]
 name = "quake-alert-bot"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2021"
 license = "Unlicense"
 description = "P2P地震情報のWebSocketを購読し、日本国内の強い揺れの地震をDiscord Webhookへ地図画像付きで通知するbot"
