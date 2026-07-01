@@ -110,10 +110,12 @@ pub fn render_quake_map_with_points(
         .build()?;
 
     // 震度の弱い順に観測地点マーカーを描き、強い揺れが手前(上)に来るようにする。
+    // 地点数が多い詳報では市区町村単位で密集するため、半径を絞って重なりを抑える。
+    let (outline_r, inner_r) = marker_radii(markers.len());
     let mut ordered: Vec<&(f64, f64, i32)> = markers.iter().collect();
     ordered.sort_by_key(|m| m.2);
     for &(m_lat, m_lon, m_scale) in ordered {
-        let (outline, inner) = marker_pair(m_lat, m_lon, m_scale)?;
+        let (outline, inner) = marker_pair(m_lat, m_lon, m_scale, outline_r, inner_r)?;
         map.add_tool(outline);
         map.add_tool(inner);
     }
@@ -153,10 +155,12 @@ pub fn render_markers_map(markers: &[(f64, f64, i32)], tile_url_template: &str) 
         .build()?;
 
     // 震度の弱い順に追加し、強い揺れのマーカーが手前(上)に来るようにする。
+    // 地点数が多い詳報では市区町村単位で密集するため、半径を絞って重なりを抑える。
+    let (outline_r, inner_r) = marker_radii(markers.len());
     let mut ordered: Vec<&(f64, f64, i32)> = markers.iter().collect();
     ordered.sort_by_key(|m| m.2);
     for &(lat, lon, scale) in ordered {
-        let (outline, inner) = marker_pair(lat, lon, scale)?;
+        let (outline, inner) = marker_pair(lat, lon, scale, outline_r, inner_r)?;
         map.add_tool(outline);
         map.add_tool(inner);
     }
@@ -165,20 +169,39 @@ pub fn render_markers_map(markers: &[(f64, f64, i32)], tile_url_template: &str) 
     encode_webp(&png)
 }
 
+/// 観測地点マーカーの半径(px)を `(縁, 中心)` で返す。
+///
+/// 詳報では市区町村単位で数百件の観測点が密集しうるため、地点数が多いほど
+/// 半径を絞り、重なり合って判読しづらくなるのを防ぐ。
+fn marker_radii(count: usize) -> (f32, f32) {
+    match count {
+        0..=15 => (11.0, 8.0),
+        16..=60 => (7.0, 5.0),
+        61..=200 => (5.0, 3.5),
+        _ => (3.5, 2.5),
+    }
+}
+
 /// 震度色の二重円マーカー（白縁＋中心円）を作る。
-fn marker_pair(lat: f64, lon: f64, scale: i32) -> Result<(Circle, Circle)> {
+fn marker_pair(
+    lat: f64,
+    lon: f64,
+    scale: i32,
+    outline_radius: f32,
+    inner_radius: f32,
+) -> Result<(Circle, Circle)> {
     let (r, g, b) = marker_rgb(scale);
     let outline = CircleBuilder::new()
         .lon_coordinate(lon)
         .lat_coordinate(lat)
         .color(Color::new(true, 255, 255, 255, 255))
-        .radius(11.0)
+        .radius(outline_radius)
         .build()?;
     let inner = CircleBuilder::new()
         .lon_coordinate(lon)
         .lat_coordinate(lat)
         .color(Color::new(true, r, g, b, 255))
-        .radius(8.0)
+        .radius(inner_radius)
         .build()?;
     Ok((outline, inner))
 }
