@@ -207,14 +207,45 @@ fn prefs_at_scale(points: &[Point], scale: i32) -> Vec<&str> {
     out
 }
 
+/// 指定スケールちょうどの予想震度を持つ地域の都府県名（表示用に接尾辞を補った形）を、
+/// 出現順・重複なしで返す。
+fn eew_prefs_at_scale(areas: &[EewArea], scale: i32) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for a in areas {
+        if a.scale_to == scale && !a.pref.is_empty() {
+            let display = display_pref(&a.pref);
+            if !out.contains(&display) {
+                out.push(display);
+            }
+        }
+    }
+    out
+}
+
+/// 556 の接尾辞なし都府県名（例: "神奈川"）に、551 と同じ表示形（例: "神奈川県"）の
+/// 接尾辞を補う。
+fn display_pref(pref: &str) -> String {
+    let np = normalize_pref(pref);
+    match np {
+        "北海道" => np.to_string(),
+        "東京" => format!("{np}都"),
+        "大阪" | "京都" => format!("{np}府"),
+        _ => format!("{np}県"),
+    }
+}
+
 /// 都道府県名の一覧を表示用にまとめる（最大4件、超過分は「など」に畳む）。
-fn format_place(prefs: &[&str]) -> String {
+fn format_place<S: AsRef<str>>(prefs: &[S]) -> String {
     const MAX: usize = 4;
     if prefs.is_empty() {
         return "各地".to_string();
     }
     let shown = prefs.len().min(MAX);
-    let mut place = prefs[..shown].join("・");
+    let mut place = prefs[..shown]
+        .iter()
+        .map(|s| s.as_ref())
+        .collect::<Vec<_>>()
+        .join("・");
     if prefs.len() > shown {
         place.push_str("など");
     }
@@ -230,19 +261,22 @@ pub fn decide_eew(
     region_min_scales: &HashMap<String, i32>,
     other_min_scale: i32,
 ) -> NotifyDecision {
-    let mut best: Option<(&str, i32)> = None;
+    // 地方しきい値を満たす地域のうち、最大の予想震度スケールを求める。
+    let mut best_scale: Option<i32> = None;
     for a in areas {
         let region = region_of(&a.pref);
         let threshold = region_threshold(region, region_min_scales, other_min_scale);
-        if a.scale_to >= threshold && best.is_none_or(|(_, s)| a.scale_to > s) {
-            best = Some((region.unwrap_or("全国"), a.scale_to));
+        if a.scale_to >= threshold {
+            best_scale = Some(best_scale.map_or(a.scale_to, |s| s.max(a.scale_to)));
         }
     }
 
-    if let Some((label, scale)) = best {
+    if let Some(scale) = best_scale {
+        // 通知ポップアップでも場所が分かるよう、その予想最大震度の都府県名で示す。
+        let place = format_place(&eew_prefs_at_scale(areas, scale));
         return NotifyDecision {
             notify: true,
-            reason: format!("{label}で予想最大震度{}", scale_label(scale)),
+            reason: format!("{place}で予想最大震度{}", scale_label(scale)),
         };
     }
 
@@ -379,7 +413,18 @@ mod tests {
         let areas = vec![area("神奈川", 40), area("大阪", 30)];
         let d = decide_eew(&areas, &kanto40(), 50);
         assert!(d.notify);
-        assert!(d.reason.contains("関東"));
+        // 理由文は地方名ではなく、接尾辞を補った都府県名で示す。
+        assert_eq!(d.reason, "神奈川県で予想最大震度4");
+    }
+
+    #[test]
+    fn eew_reason_lists_prefs_at_max_scale() {
+        // 複数県が同じ予想最大震度の場合は、その県名を列挙する（地方名にまとめない）。
+        let scales = HashMap::from([("東北".to_string(), 40)]);
+        let areas = vec![area("青森", 45), area("岩手", 45), area("岩手", 40), area("宮城", 30)];
+        let d = decide_eew(&areas, &scales, 50);
+        assert!(d.notify);
+        assert_eq!(d.reason, "青森県・岩手県で予想最大震度5弱");
     }
 
     #[test]
