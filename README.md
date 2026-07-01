@@ -88,8 +88,10 @@ src/
   config.rs     … 環境変数の読み込み
   model.rs      … P2P地震情報 API のレスポンス型(serde)
   intensity.rs  … 震度変換・通知条件の判定（単体テストあり）
-  mapgen.rs     … 震源地をプロットした地図WebPの生成(staticmap、既定は地理院タイル)
+  geo.rs        … 観測点(市区町村)・都道府県の座標テーブルとマーカー変換
+  mapgen.rs     … 震源地・各地の震度をプロットした地図WebPの生成(staticmap、既定は地理院タイル)
   discord.rs    … Discord embed の組み立てと Webhook 送信(multipart)
+  data/observation_points.tsv … 観測点名→座標のデータ（気象庁公表データを基に集約、CC BY 4.0）
 ```
 
 ## 動作の概要

@@ -462,9 +462,10 @@ async fn handle_quake(
             let lat = eq.hypocenter.latitude;
             let lon = eq.hypocenter.longitude;
             let scale = eq.max_scale;
+            let markers = geo::points_to_markers(&quake.points);
             Some(
                 tokio::task::spawn_blocking(move || {
-                    mapgen::render_quake_map(lat, lon, scale, &tile_tpl)
+                    mapgen::render_quake_map_with_points(lat, lon, scale, &markers, &tile_tpl)
                 })
                 .await?,
             )

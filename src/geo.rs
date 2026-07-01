@@ -1,12 +1,43 @@
-//! 都道府県の代表座標テーブルと、観測点からマーカー一覧への変換。
+//! 観測点(市区町村)・都道府県の座標テーブルと、観測点からマーカー一覧への変換。
 //!
-//! P2P地震情報の `points` には座標が含まれないため、震源が未確定（震度速報など）の
-//! 段階で地図を描くには、県名から代表座標を引く必要がある。代表座標は各都道府県庁の
-//! おおよその位置を用いる。キーは 551 の `points.pref`（"宮城県" 等の正式名）に一致させる。
+//! P2P地震情報の `points` には座標が含まれないため、地図を描くには地点名から
+//! 座標を引く必要がある。`addr`（観測点名。例: "八戸市湊町"）が
+//! `data/observation_points.tsv` の座標テーブルに一致すれば、その市区町村・観測点の
+//! 正確な座標にプロットする（詳報 `DetailScale` はこの粒度）。一致しない地点
+//! （震度速報の地域名など）は都道府県の代表座標へフォールバックする。
 
 use std::collections::HashMap;
+use std::sync::OnceLock;
 
 use crate::model::Point;
+
+/// 観測点名 → (緯度, 経度) の座標データ（タブ区切り: 名前\t緯度\t経度）。
+///
+/// 気象庁が公開する震度観測点情報（都道府県・市区町村の震度観測点、CC BY 4.0）を
+/// もとに集約したデータ。観測点の統廃合により将来的にズレが生じる可能性がある。
+const OBSERVATION_POINTS_TSV: &str = include_str!("data/observation_points.tsv");
+
+/// 観測点名 → 座標のルックアップテーブルを初回アクセス時にパースして返す。
+fn observation_points() -> &'static HashMap<&'static str, (f64, f64)> {
+    static CACHE: OnceLock<HashMap<&'static str, (f64, f64)>> = OnceLock::new();
+    CACHE.get_or_init(|| {
+        OBSERVATION_POINTS_TSV
+            .lines()
+            .filter_map(|line| {
+                let mut cols = line.split('\t');
+                let name = cols.next()?;
+                let lat: f64 = cols.next()?.parse().ok()?;
+                let lon: f64 = cols.next()?.parse().ok()?;
+                Some((name, (lat, lon)))
+            })
+            .collect()
+    })
+}
+
+/// 観測点名（`points.addr`）から正確な座標 (緯度, 経度) を引く。未収録の地点は None。
+pub fn observation_point_coord(addr: &str) -> Option<(f64, f64)> {
+    observation_points().get(addr).copied()
+}
 
 /// 都道府県名 → 代表座標 (緯度, 経度)。県名は 551 の `points.pref` の表記に合わせる。
 const PREF_COORDS: &[(&str, f64, f64)] = &[
@@ -67,25 +98,37 @@ pub fn pref_coord(pref: &str) -> Option<(f64, f64)> {
         .map(|(_, lat, lon)| (*lat, *lon))
 }
 
-/// 観測点を都道府県ごとにまとめ、地図に描く `(緯度, 経度, 最大震度スケール)` の一覧へ変換する。
+/// 観測点を地図に描く `(緯度, 経度, 震度スケール)` の一覧へ変換する。
 ///
-/// 同一県は最大震度を採用する。代表座標が引けない県（海外・離島の予報区など）は除外する。
+/// `addr` が観測点座標テーブルに一致する地点は、その市区町村・観測点の正確な座標に
+/// 個別のマーカーとしてプロットする。一致しない地点（震度速報の地域名など）は
+/// 都道府県ごとにまとめ、代表座標へフォールバックする（同一県は最大震度を採用）。
+/// 代表座標も引けない県（海外・離島の予報区など）は除外する。
 pub fn points_to_markers(points: &[Point]) -> Vec<(f64, f64, i32)> {
-    let mut max_by_pref: HashMap<&str, i32> = HashMap::new();
+    let mut markers: Vec<(f64, f64, i32)> = Vec::new();
+    let mut fallback_max_by_pref: HashMap<&str, i32> = HashMap::new();
+
     for p in points {
         if p.scale < 0 || p.pref.is_empty() {
             continue;
         }
-        let entry = max_by_pref.entry(p.pref.as_str()).or_insert(p.scale);
+        if let Some((lat, lon)) = observation_point_coord(&p.addr) {
+            markers.push((lat, lon, p.scale));
+            continue;
+        }
+        let entry = fallback_max_by_pref.entry(p.pref.as_str()).or_insert(p.scale);
         if p.scale > *entry {
             *entry = p.scale;
         }
     }
 
-    max_by_pref
-        .into_iter()
-        .filter_map(|(pref, scale)| pref_coord(pref).map(|(lat, lon)| (lat, lon, scale)))
-        .collect()
+    markers.extend(
+        fallback_max_by_pref
+            .into_iter()
+            .filter_map(|(pref, scale)| pref_coord(pref).map(|(lat, lon)| (lat, lon, scale))),
+    );
+
+    markers
 }
 
 #[cfg(test)]
@@ -100,10 +143,47 @@ mod tests {
         }
     }
 
+    fn pt_addr(pref: &str, addr: &str, scale: i32) -> Point {
+        Point {
+            pref: pref.to_string(),
+            addr: addr.to_string(),
+            scale,
+        }
+    }
+
     #[test]
     fn coord_lookup() {
         assert!(pref_coord("宮城県").is_some());
         assert!(pref_coord("存在しない県").is_none());
+    }
+
+    #[test]
+    fn observation_point_lookup() {
+        assert!(observation_point_coord("八戸市湊町").is_some());
+        assert!(observation_point_coord("存在しない観測点").is_none());
+    }
+
+    #[test]
+    fn markers_use_observation_point_coord_when_addr_matches() {
+        // addr が観測点座標テーブルに一致する場合は、県代表座標ではなく
+        // その観測点の正確な座標を個別マーカーとして使う。
+        let points = vec![pt_addr("青森県", "八戸市湊町", 40)];
+        let markers = points_to_markers(&points);
+        assert_eq!(markers.len(), 1);
+        let station_coord = observation_point_coord("八戸市湊町").unwrap();
+        assert_eq!((markers[0].0, markers[0].1), station_coord);
+        assert_ne!((markers[0].0, markers[0].1), pref_coord("青森県").unwrap());
+        assert_eq!(markers[0].2, 40);
+    }
+
+    #[test]
+    fn markers_fall_back_to_pref_when_addr_unmatched() {
+        // 震度速報などの地域名（addr）は座標テーブルに無いため、県代表座標に集約される。
+        let points = vec![pt_addr("宮城県", "宮城県北部", 45), pt_addr("宮城県", "宮城県南部", 30)];
+        let markers = points_to_markers(&points);
+        assert_eq!(markers.len(), 1);
+        assert_eq!((markers[0].0, markers[0].1), pref_coord("宮城県").unwrap());
+        assert_eq!(markers[0].2, 45); // 最大震度を採用
     }
 
     #[test]
