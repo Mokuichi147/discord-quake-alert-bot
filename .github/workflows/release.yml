@@ -67,3 +67,4 @@ jobs:
         with:
           files: ${{ env.ASSET }}
           fail_on_unmatched_files: true
+          generate_release_notes: true
