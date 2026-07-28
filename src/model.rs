@@ -46,7 +46,8 @@ pub struct Earthquake {
     pub time: String,
     #[serde(default)]
     pub hypocenter: Hypocenter,
-    /// 最大震度。10=1, 20=2, 30=3, 40=4, 45=5弱, 50=5強, 55=6弱, 60=6強, 70=7, -1=不明。
+    /// 最大震度。10=1, 20=2, 30=3, 40=4, 45=5弱, 46=5弱以上と推定, 50=5強, 55=6弱,
+    /// 60=6強, 70=7, -1=不明。
     #[serde(rename = "maxScale", default = "minus_one")]
     pub max_scale: i32,
     /// 国内津波の有無（"None" / "Unknown" / "Checking" / "NonEffective" / "Watch" / "Warning"）。
@@ -82,6 +83,7 @@ pub struct Point {
     #[serde(default)]
     pub addr: String,
     /// その地点の震度スケール（Earthquake.max_scale と同じ値域）。
+    /// 揺れが強く震度情報を入手できていない地点には 46（5弱以上と推定）が入る。
     #[serde(default = "minus_one")]
     pub scale: i32,
 }

@@ -65,6 +65,9 @@ pub fn scale_label(scale: i32) -> &'static str {
         30 => "3",
         40 => "4",
         45 => "5弱",
+        // 46 は「震度5弱以上と推定」（揺れが強い等で震度情報が入手できていない地点）。
+        // 上限が不明なため下限のみを示す。
+        46 => "5弱以上",
         50 => "5強",
         55 => "6弱",
         60 => "6強",
@@ -73,27 +76,37 @@ pub fn scale_label(scale: i32) -> &'static str {
     }
 }
 
-/// 震度に応じた埋め込みカラー（揺れが強いほど赤系）。
+/// 震度に応じた埋め込みカラー。気象庁の震度分布図と同じ並び
+/// （1=灰系 → 2=水色 → 3=緑 → 4=黄 → 5弱以上=暖色 → 7=紫）で段階を分ける。
+/// `marker_rgb` と同じ配色にすること（`color_functions_agree` で検証している）。
 pub fn embed_color(scale: i32) -> u32 {
     match scale {
-        s if s >= 60 => 0x8B_00_00, // 6強・7: 濃い赤
+        s if s >= 70 => 0x8C_00_A0, // 7: 紫（6強と区別する）
+        s if s >= 60 => 0x8B_00_00, // 6強: 濃い赤
         55 => 0xE0_00_00,           // 6弱
         50 => 0xFF_44_00,           // 5強
-        45 => 0xFF_88_00,           // 5弱
+        45 | 46 => 0xFF_88_00,      // 5弱・5弱以上と推定（下限の色で示す）
         40 => 0xFF_C0_00,           // 4
-        _ => 0x33_99_FF,            // 3以下・不明
+        30 => 0x00_B0_50,           // 3: 緑
+        20 => 0x33_99_FF,           // 2: 水色
+        10 => 0x7C_8B_99,           // 1: 青灰（白地図に埋もれないよう灰は濃いめ）
+        _ => 0xB0_B0_B0,            // 不明
     }
 }
 
-/// 地図マーカー色 (R, G, B)。
+/// 地図マーカー色 (R, G, B)。`embed_color` と同じ配色。
 pub fn marker_rgb(scale: i32) -> (u8, u8, u8) {
     match scale {
+        s if s >= 70 => (140, 0, 160),
         s if s >= 60 => (139, 0, 0),
         55 => (224, 0, 0),
         50 => (255, 68, 0),
-        45 => (255, 136, 0),
+        45 | 46 => (255, 136, 0),
         40 => (255, 192, 0),
-        _ => (51, 153, 255),
+        30 => (0, 176, 80),
+        20 => (51, 153, 255),
+        10 => (124, 139, 153),
+        _ => (176, 176, 176),
     }
 }
 
@@ -319,6 +332,43 @@ mod tests {
         assert_eq!(region_of("宮城"), Some("東北"));
         assert_eq!(region_of("大阪府"), Some("近畿"));
         assert_eq!(region_of("ハワイ"), None);
+    }
+
+    #[test]
+    fn scale46_is_treated_as_5jaku() {
+        // 46(5弱以上と推定)は震源近傍で出やすい。45と同じ扱いにして、
+        // 「不明」扱い（震度3以下と同じ水色）に落ちないことを確認する。
+        assert_eq!(scale_label(46), "5弱以上");
+        assert_eq!(marker_rgb(46), marker_rgb(45));
+        assert_eq!(embed_color(46), embed_color(45));
+        assert_ne!(marker_rgb(46), marker_rgb(30));
+    }
+
+    /// 実データに現れる scale の全値（-1 は不明）。
+    const ALL_SCALES: &[i32] = &[-1, 10, 20, 30, 40, 45, 46, 50, 55, 60, 70];
+
+    #[test]
+    fn color_functions_agree() {
+        // embed_color と marker_rgb は同じ配色でなければならない。
+        for &s in ALL_SCALES {
+            let (r, g, b) = marker_rgb(s);
+            let packed = (u32::from(r) << 16) | (u32::from(g) << 8) | u32::from(b);
+            assert_eq!(embed_color(s), packed, "scale={s} で配色が食い違っている");
+        }
+    }
+
+    #[test]
+    fn each_scale_has_a_distinct_color() {
+        // 6強と7、震度1・2・3 がそれぞれ別色になっていること
+        // （45と46だけは意図的に同色なので除く）。
+        for &a in ALL_SCALES {
+            for &b in ALL_SCALES {
+                if a >= b || (a == 45 && b == 46) {
+                    continue;
+                }
+                assert_ne!(marker_rgb(a), marker_rgb(b), "scale {a} と {b} が同色");
+            }
+        }
     }
 
     #[test]
