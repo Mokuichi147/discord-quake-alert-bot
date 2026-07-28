@@ -275,13 +275,17 @@ pub fn decide_eew(
     other_min_scale: i32,
 ) -> NotifyDecision {
     // 地方しきい値を満たす地域のうち、最大の予想震度スケールを求める。
-    // 「〜程度以上」(99) は下限で判定する（99 のままだと必ずしきい値を超えてしまう）。
+    //
+    // 「〜程度以上」(99) は上限が示されていない＝しきい値に達しうるため、下限が
+    // しきい値未満でも通知対象にする。緊急地震速報の第1報はこの形で来るので、
+    // 下限で足切りすると「大きな揺れが予想されるが確定していない」最も危険な報を
+    // 取りこぼす。556 自体が稀（発表がない週もある）なので通知過多にはならない。
     let mut best_scale: Option<i32> = None;
     for a in areas {
         let region = region_of(&a.pref);
         let threshold = region_threshold(region, region_min_scales, other_min_scale);
         let scale = eew_area_scale(a);
-        if scale >= threshold {
+        if scale >= threshold || a.scale_to == SCALE_TO_UNBOUNDED {
             best_scale = Some(best_scale.map_or(scale, |s| s.max(scale)));
         }
     }
@@ -339,8 +343,9 @@ pub fn is_unbounded_at(areas: &[EewArea], scale: i32) -> bool {
 }
 
 /// 予想震度の表示ラベル。`unbounded` なら「程度以上」を付けて下限であることを示す。
+/// 下限自体が不明(-1)の場合は「不明程度以上」にならないよう「不明」とする。
 pub fn eew_scale_label(scale: i32, unbounded: bool) -> String {
-    if unbounded {
+    if unbounded && scale >= 0 {
         format!("{}程度以上", scale_label(scale))
     } else {
         scale_label(scale).to_string()
@@ -559,15 +564,26 @@ mod tests {
     }
 
     #[test]
-    fn unbounded_scale_respects_region_threshold() {
-        // 99 をそのまま比較すると必ずしきい値を超え、設定を素通りして通知されていた。
-        // 下限で判定するので、下限がしきい値未満なら通知しない。
+    fn unbounded_scale_notifies_even_below_threshold() {
+        // 上限が示されていない第1報は、下限がしきい値未満でも通知する。
+        // 下限で足切りすると、上限不明＝大きな揺れが予想される最も危険な報を取りこぼす。
         let areas = vec![area_unbounded("熊本", 45)];
-        assert!(!decide_eew(&areas, &kanto40(), 50).notify);
-        // 下限がしきい値以上なら通知し、理由文も下限表記にする。
-        let d = decide_eew(&areas, &kanto40(), 45);
+        let d = decide_eew(&areas, &kanto40(), 50);
         assert!(d.notify);
+        // 予想最大震度は下限で示す（99 を震度値として扱わない）。
         assert_eq!(d.reason, "熊本県で予想最大震度5弱程度以上");
+    }
+
+    #[test]
+    fn bounded_scale_below_threshold_does_not_notify() {
+        // 上限が確定している報は従来どおりしきい値で判定する。
+        assert!(!decide_eew(&[area("熊本", 45)], &kanto40(), 50).notify);
+    }
+
+    #[test]
+    fn unknown_lower_bound_stays_unknown() {
+        // 下限自体が不明(-1)なら「不明程度以上」ではなく「不明」とする。
+        assert_eq!(eew_scale_label(-1, true), "不明");
     }
 
     #[test]
