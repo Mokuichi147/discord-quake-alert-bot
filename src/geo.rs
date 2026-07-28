@@ -150,7 +150,9 @@ pub fn eew_areas_to_markers(areas: &[EewArea]) -> Vec<(f64, f64, i32)> {
     for a in areas {
         // 「〜程度以上」(99) は上限が不明なので下限を代表値にする。
         let scale = eew_area_scale(a);
-        if scale < 0 || a.pref.is_empty() {
+        // 震度0（揺れを感じない）は描いても情報にならないので除外する。
+        // 551 の points には 0 が無いため、この判定は 556 側にだけ必要。
+        if scale <= 0 || a.pref.is_empty() {
             continue;
         }
         if let Some((lat, lon)) = observation_point_coord(&a.name) {
@@ -294,5 +296,14 @@ mod tests {
     fn eew_markers_skip_invalid_scale() {
         let areas = vec![area("神奈川", "神奈川県西部", -1)];
         assert!(eew_areas_to_markers(&areas).is_empty());
+    }
+
+    #[test]
+    fn eew_markers_skip_shindo0() {
+        // 震度0（揺れを感じない）は描いても情報にならないので除外する。
+        let areas = vec![area("神奈川", "神奈川県西部", 0)];
+        assert!(eew_areas_to_markers(&areas).is_empty());
+        // 震度1以上は描く。
+        assert_eq!(eew_areas_to_markers(&[area("神奈川", "神奈川県西部", 10)]).len(), 1);
     }
 }

@@ -60,6 +60,8 @@ fn region_threshold(
 /// P2P地震情報のscale値を震度表記へ変換する。
 pub fn scale_label(scale: i32) -> &'static str {
     match scale {
+        // 0 は 556 の scaleFrom/scaleTo にのみ現れる（551 の scale・maxScale には無い）。
+        0 => "0",
         10 => "1",
         20 => "2",
         30 => "3",
@@ -90,6 +92,7 @@ pub fn embed_color(scale: i32) -> u32 {
         30 => 0x00_B0_50,           // 3: 緑
         20 => 0x33_99_FF,           // 2: 水色
         10 => 0x7C_8B_99,           // 1: 青灰（白地図に埋もれないよう灰は濃いめ）
+        0 => 0xC0_C8_D0,            // 0: 揺れを感じない
         _ => 0xB0_B0_B0,            // 不明
     }
 }
@@ -106,6 +109,7 @@ pub fn marker_rgb(scale: i32) -> (u8, u8, u8) {
         30 => (0, 176, 80),
         20 => (51, 153, 255),
         10 => (124, 139, 153),
+        0 => (192, 200, 208),
         _ => (176, 176, 176),
     }
 }
@@ -403,8 +407,16 @@ mod tests {
         assert_ne!(marker_rgb(46), marker_rgb(30));
     }
 
-    /// 実データに現れる scale の全値（-1 は不明）。
-    const ALL_SCALES: &[i32] = &[-1, 10, 20, 30, 40, 45, 46, 50, 55, 60, 70];
+    /// 仕様上ありうる scale の全値。-1=不明、0 は 556 の scaleFrom/scaleTo のみ、
+    /// 46 は 551 の points のみ、99(〜程度以上) は震度値ではないので含めない。
+    const ALL_SCALES: &[i32] = &[-1, 0, 10, 20, 30, 40, 45, 46, 50, 55, 60, 70];
+
+    #[test]
+    fn shindo0_is_not_unknown() {
+        // 震度0(556の scaleFrom/scaleTo にのみ現れる)を「不明」と表示しない。
+        assert_eq!(scale_label(0), "0");
+        assert_ne!(marker_rgb(0), marker_rgb(-1));
+    }
 
     #[test]
     fn color_functions_agree() {

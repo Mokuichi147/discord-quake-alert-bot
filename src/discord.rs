@@ -227,9 +227,11 @@ pub fn build_eew_payload(eew: &Eew, reason: &str, with_image: bool, is_test: boo
 
     // 対象地域を予想震度ごとにまとめる（震度速報・地震情報と同じ「震度X: …」表記に統一）。
     // 「〜程度以上」(99) の地域は下限で分類し、行頭に「程度以上」を付けて下限と分かるようにする。
+    // 震度0（揺れを感じない）は「強い揺れが予想される地域」に並べても情報にならない。
     let area_items: Vec<(&str, i32)> = eew
         .areas
         .iter()
+        .filter(|a| eew_area_scale(a) > 0)
         .map(|a| (a.name.as_str(), eew_area_scale(a)))
         .collect();
     let area_text = fmt_intensity_groups(&area_items, "地域", |s| {
@@ -489,5 +491,33 @@ mod tests {
         ];
         let text = fmt_intensity_groups(&items, "地域", |s| scale_label(s).to_string()).unwrap();
         assert_eq!(text, "5弱: 神奈川県西部、神奈川県東部\n4: 東京都23区");
+    }
+
+    #[test]
+    fn eew_area_list_omits_shindo0() {
+        // 震度0の地域は「強い揺れが予想される地域」に載せない。
+        let eew = Eew {
+            code: 556,
+            cancelled: false,
+            issue: Default::default(),
+            earthquake: Default::default(),
+            areas: vec![
+                crate::model::EewArea {
+                    pref: "神奈川".to_string(),
+                    name: "神奈川県西部".to_string(),
+                    scale_from: 45,
+                    scale_to: 45,
+                },
+                crate::model::EewArea {
+                    pref: "東京".to_string(),
+                    name: "東京都23区".to_string(),
+                    scale_from: 0,
+                    scale_to: 0,
+                },
+            ],
+        };
+        let payload = build_eew_payload(&eew, "", false, false);
+        let areas = payload["embeds"][0]["fields"][4]["value"].as_str().unwrap();
+        assert_eq!(areas, "5弱: 神奈川県西部");
     }
 }
