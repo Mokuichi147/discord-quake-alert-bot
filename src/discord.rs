@@ -4,7 +4,8 @@ use anyhow::{Context, Result};
 use serde_json::{json, Value};
 
 use crate::intensity::{
-    embed_color, eew_max_scale, has_tsunami, scale_label, tsunami_grade_color, tsunami_grade_label,
+    embed_color, eew_area_scale, eew_max_scale, eew_max_scale_label, eew_scale_label,
+    has_tsunami, is_unbounded_at, scale_label, tsunami_grade_color, tsunami_grade_label,
     tsunami_grade_rank, tsunami_label,
 };
 use crate::model::{Eew, JmaQuake, Point, Tsunami};
@@ -114,7 +115,14 @@ const MAX_NAMES_PER_SCALE: usize = 12;
 ///
 /// 震度の高い順に並べ、同一震度内は出現順で重複を除き、`MAX_NAMES_PER_SCALE` を
 /// 超えたら「ほかN{unit}」に畳む。対象が1つも無ければ `None`。
-fn fmt_intensity_groups(items: &[(&str, i32)], unit: &str) -> Option<String> {
+///
+/// `label` は震度スケールを行頭の表記へ変換する。緊急地震速報では「〜程度以上」を
+/// 付ける必要があるため、呼び出し側で差し替えられるようにしている。
+fn fmt_intensity_groups(
+    items: &[(&str, i32)],
+    unit: &str,
+    label: impl Fn(i32) -> String,
+) -> Option<String> {
     use std::collections::BTreeMap;
 
     // scale -> 名称（出現順・重複なし）。BTreeMap でキー昇順に整列する。
@@ -143,7 +151,7 @@ fn fmt_intensity_groups(items: &[(&str, i32)], unit: &str) -> Option<String> {
             if names.len() > shown {
                 joined.push_str(&format!(" ほか{}{unit}", names.len() - shown));
             }
-            format!("{}: {}", scale_label(*scale), joined)
+            format!("{}: {}", label(*scale), joined)
         })
         .collect();
 
@@ -164,7 +172,7 @@ fn fmt_points(points: &[Point]) -> Option<String> {
             (name, p.scale)
         })
         .collect();
-    fmt_intensity_groups(&items, "地点")
+    fmt_intensity_groups(&items, "地点", |s| scale_label(s).to_string())
 }
 
 /// マグニチュード表記（不明は -1 未満で判定）。
@@ -218,16 +226,22 @@ pub fn build_eew_payload(eew: &Eew, reason: &str, with_image: bool, is_test: boo
     };
 
     // 対象地域を予想震度ごとにまとめる（震度速報・地震情報と同じ「震度X: …」表記に統一）。
+    // 「〜程度以上」(99) の地域は下限で分類し、行頭に「程度以上」を付けて下限と分かるようにする。
+    // 震度0（揺れを感じない）は「強い揺れが予想される地域」に並べても情報にならない。
     let area_items: Vec<(&str, i32)> = eew
         .areas
         .iter()
-        .map(|a| (a.name.as_str(), a.scale_to))
+        .filter(|a| eew_area_scale(a) > 0)
+        .map(|a| (a.name.as_str(), eew_area_scale(a)))
         .collect();
-    let area_text = fmt_intensity_groups(&area_items, "地域").unwrap_or_else(|| "—".to_string());
+    let area_text = fmt_intensity_groups(&area_items, "地域", |s| {
+        eew_scale_label(s, is_unbounded_at(&eew.areas, s))
+    })
+    .unwrap_or_else(|| "—".to_string());
 
     let title = format!(
         "{test_prefix}⚡ 緊急地震速報（予想最大震度 {}）",
-        scale_label(max_scale)
+        eew_max_scale_label(&eew.areas)
     );
 
     let mut footer = String::from("出典: 気象庁 緊急地震速報（P2P地震情報経由・予想値）");
@@ -475,7 +489,35 @@ mod tests {
             ("東京都23区", 40),
             ("神奈川県東部", 45),
         ];
-        let text = fmt_intensity_groups(&items, "地域").unwrap();
+        let text = fmt_intensity_groups(&items, "地域", |s| scale_label(s).to_string()).unwrap();
         assert_eq!(text, "5弱: 神奈川県西部、神奈川県東部\n4: 東京都23区");
+    }
+
+    #[test]
+    fn eew_area_list_omits_shindo0() {
+        // 震度0の地域は「強い揺れが予想される地域」に載せない。
+        let eew = Eew {
+            code: 556,
+            cancelled: false,
+            issue: Default::default(),
+            earthquake: Default::default(),
+            areas: vec![
+                crate::model::EewArea {
+                    pref: "神奈川".to_string(),
+                    name: "神奈川県西部".to_string(),
+                    scale_from: 45,
+                    scale_to: 45,
+                },
+                crate::model::EewArea {
+                    pref: "東京".to_string(),
+                    name: "東京都23区".to_string(),
+                    scale_from: 0,
+                    scale_to: 0,
+                },
+            ],
+        };
+        let payload = build_eew_payload(&eew, "", false, false);
+        let areas = payload["embeds"][0]["fields"][4]["value"].as_str().unwrap();
+        assert_eq!(areas, "5弱: 神奈川県西部");
     }
 }

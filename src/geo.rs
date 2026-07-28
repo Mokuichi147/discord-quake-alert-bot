@@ -10,7 +10,7 @@
 use std::collections::HashMap;
 use std::sync::OnceLock;
 
-use crate::intensity::display_pref;
+use crate::intensity::{display_pref, eew_area_scale};
 use crate::model::{EewArea, Point};
 
 /// 観測点名 → (緯度, 経度) の座標データ（タブ区切り: 名前\t緯度\t経度）。
@@ -148,17 +148,21 @@ pub fn eew_areas_to_markers(areas: &[EewArea]) -> Vec<(f64, f64, i32)> {
     let mut fallback_max_by_pref: HashMap<String, i32> = HashMap::new();
 
     for a in areas {
-        if a.scale_to < 0 || a.pref.is_empty() {
+        // 「〜程度以上」(99) は上限が不明なので下限を代表値にする。
+        let scale = eew_area_scale(a);
+        // 震度0（揺れを感じない）は描いても情報にならないので除外する。
+        // 551 の points には 0 が無いため、この判定は 556 側にだけ必要。
+        if scale <= 0 || a.pref.is_empty() {
             continue;
         }
         if let Some((lat, lon)) = observation_point_coord(&a.name) {
-            markers.push((lat, lon, a.scale_to));
+            markers.push((lat, lon, scale));
             continue;
         }
         let pref = display_pref(&a.pref);
-        let entry = fallback_max_by_pref.entry(pref).or_insert(a.scale_to);
-        if a.scale_to > *entry {
-            *entry = a.scale_to;
+        let entry = fallback_max_by_pref.entry(pref).or_insert(scale);
+        if scale > *entry {
+            *entry = scale;
         }
     }
 
@@ -274,8 +278,32 @@ mod tests {
     }
 
     #[test]
+    fn eew_markers_use_lower_bound_for_unbounded_scale() {
+        // scale_to=99（〜程度以上）は下限でプロットする。99 のままだと
+        // 震度7より濃い色になり、実際の予想（5弱程度以上）と食い違う。
+        let areas = vec![EewArea {
+            pref: "熊本".to_string(),
+            name: "熊本県熊本".to_string(),
+            scale_from: 45,
+            scale_to: 99,
+        }];
+        let markers = eew_areas_to_markers(&areas);
+        assert_eq!(markers.len(), 1);
+        assert_eq!(markers[0].2, 45);
+    }
+
+    #[test]
     fn eew_markers_skip_invalid_scale() {
         let areas = vec![area("神奈川", "神奈川県西部", -1)];
         assert!(eew_areas_to_markers(&areas).is_empty());
+    }
+
+    #[test]
+    fn eew_markers_skip_shindo0() {
+        // 震度0（揺れを感じない）は描いても情報にならないので除外する。
+        let areas = vec![area("神奈川", "神奈川県西部", 0)];
+        assert!(eew_areas_to_markers(&areas).is_empty());
+        // 震度1以上は描く。
+        assert_eq!(eew_areas_to_markers(&[area("神奈川", "神奈川県西部", 10)]).len(), 1);
     }
 }

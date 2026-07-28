@@ -21,7 +21,7 @@ use tokio_tungstenite::tungstenite::Message;
 use tracing::{error, info, warn};
 
 use crate::config::Config;
-use crate::intensity::{decide, decide_eew, eew_max_scale, tsunami_grade_rank};
+use crate::intensity::{decide, decide_eew, eew_max_scale, eew_summary, tsunami_grade_rank};
 use crate::model::{Eew, Envelope, JmaQuake, Tsunami};
 
 /// 地震情報メッセージの code。
@@ -54,11 +54,6 @@ impl SeenIds {
             }
         }
         true
-    }
-
-    /// 既に登録済みか。
-    fn contains(&self, id: &str) -> bool {
-        self.set.contains(id)
     }
 }
 
@@ -102,6 +97,48 @@ impl QuakeTracker {
     }
 }
 
+/// 緊急地震速報(556)の投稿状態を eventId ごとに保持する。
+///
+/// 続報で予想が変わったら同じメッセージを差し替えるため message_id を持つ。
+/// 続報を捨てると、通知後に予想が引き下げられた場合に古い（過大な）内容が残り続ける。
+#[derive(Default)]
+struct EewTracker {
+    map: HashMap<String, QuakePost>,
+    order: VecDeque<String>,
+}
+
+impl EewTracker {
+    /// 投稿済みか。取消報を通知してよいかの判定にも使う。
+    fn contains(&self, event_id: &str) -> bool {
+        self.map.contains_key(event_id)
+    }
+
+    /// 投稿済みなら `(message_id, signature)` を返す。未投稿は None。
+    fn posted(&self, event_id: &str) -> Option<(String, u64)> {
+        self.map
+            .get(event_id)
+            .map(|p| (p.message_id.clone(), p.signature))
+    }
+
+    /// 差し替え後の内容ハッシュを記録する。
+    fn update_signature(&mut self, event_id: &str, signature: u64) {
+        if let Some(post) = self.map.get_mut(event_id) {
+            post.signature = signature;
+        }
+    }
+
+    /// 新規投稿を記録する。容量超過で古い順に退避する。
+    fn insert(&mut self, event_id: &str, post: QuakePost) {
+        self.map.insert(event_id.to_string(), post);
+        self.order.push_back(event_id.to_string());
+        if self.order.len() > SEEN_ID_CAPACITY {
+            if let Some(old) = self.order.pop_front() {
+                self.map.remove(&old);
+            }
+        }
+    }
+}
+
 /// 表示用 payload から内容シグネチャ（ハッシュ）を求める。表示フィールドが全て反映される。
 fn signature_of(payload: &serde_json::Value) -> u64 {
     let mut hasher = DefaultHasher::new();
@@ -112,8 +149,8 @@ fn signature_of(payload: &serde_json::Value) -> u64 {
 /// 種別ごとの重複抑制状態。
 #[derive(Default)]
 struct DedupState {
-    /// 緊急地震速報の eventId（第1報のみ通知）。
-    eews: SeenIds,
+    /// 緊急地震速報の投稿状態（eventId ごと。続報は差し替え）。
+    eews: EewTracker,
     /// 津波予報の id（同一発表の再送を除去）。
     tsunamis: SeenIds,
     /// 地震情報(551)の投稿状態（速報・詳報を発生時刻ごとに保持）。
@@ -325,7 +362,7 @@ async fn run_test_eew(config: &Config, http: &reqwest::Client) -> Result<()> {
     info!(count = items.len(), "履歴を取得しました");
 
     // テスト送信なので重複抑制は効かせない（毎回新しい状態を渡す）。
-    let mut seen = SeenIds::default();
+    let mut tracker = EewTracker::default();
     for item in &items {
         let text = item.to_string();
         let eew: Eew = match serde_json::from_str(&text) {
@@ -343,7 +380,7 @@ async fn run_test_eew(config: &Config, http: &reqwest::Client) -> Result<()> {
                 reason = %decision.reason,
                 "テスト送信する緊急地震速報を選択しました"
             );
-            handle_eew(config, http, &text, true, &mut seen).await?;
+            handle_eew(config, http, &text, true, &mut tracker).await?;
             info!("テスト送信が完了しました");
             return Ok(());
         }
@@ -543,20 +580,21 @@ async fn handle_quake(
 
 /// 緊急地震速報(556) を処理する。
 ///
-/// 第1報で速報し、同一 eventId の続報は抑制する。取消報は速報済みの場合のみ通知する。
+/// 第1報で速報し、同一 eventId の続報は同じメッセージを差し替える（551 と同じ方針）。
+/// 取消報は速報済みの場合のみ通知する。
 async fn handle_eew(
     config: &Config,
     http: &reqwest::Client,
     text: &str,
     is_test: bool,
-    seen: &mut SeenIds,
+    tracker: &mut EewTracker,
 ) -> Result<()> {
     let eew: Eew = serde_json::from_str(text)?;
     let event_id = eew.issue.event_id.clone();
 
     // 取消報: 既に速報済みの地震だけ取消を通知する。
     if eew.cancelled {
-        if event_id.is_empty() || (!is_test && !seen.contains(&event_id)) {
+        if event_id.is_empty() || (!is_test && !tracker.contains(&event_id)) {
             return Ok(());
         }
         info!(event_id = %event_id, "緊急地震速報の取消を受信");
@@ -566,21 +604,33 @@ async fn handle_eew(
         return Ok(());
     }
 
-    let decision = decide_eew(&eew.areas, &config.region_min_scales, config.other_min_scale);
-    if !decision.notify {
+    // eventId が無い報は差し替え対象を特定できないため扱わない。
+    if event_id.is_empty() {
         return Ok(());
     }
 
-    // 重複報の抑制: 同一 eventId は第1報のみ通知する。
-    if event_id.is_empty() || !seen.mark_if_new(&event_id) {
+    let decision = decide_eew(&eew.areas, &config.region_min_scales, config.other_min_scale);
+    let posted = tracker.contains(&event_id);
+
+    // 未通知のまま基準を下回る報は無視する。通知済みなら、基準を下回った続報でも
+    // 差し替える。捨ててしまうと、引き下げられた予想が反映されず古い内容が残る。
+    if !decision.notify && !posted {
         return Ok(());
     }
+
+    // 基準を下回った続報には理由文が無いので、しきい値と無関係な説明文を使う。
+    let reason = if decision.notify {
+        decision.reason.clone()
+    } else {
+        eew_summary(&eew.areas)
+    };
 
     info!(
         event_id = %event_id,
         serial = %eew.issue.serial,
         place = %eew.earthquake.hypocenter.name,
-        reason = %decision.reason,
+        reason = %reason,
+        below_threshold = !decision.notify,
         "緊急地震速報を検出"
     );
 
@@ -620,9 +670,34 @@ async fn handle_eew(
         None
     };
 
-    let payload = discord::build_eew_payload(&eew, &decision.reason, image.is_some(), is_test);
-    discord::send(http, &config.webhook_url, &payload, image).await?;
-    info!("緊急地震速報を通知しました");
+    let payload = discord::build_eew_payload(&eew, &reason, image.is_some(), is_test);
+    let signature = signature_of(&payload);
+
+    // 投稿済みなら同じメッセージを差し替え、未投稿なら新規投稿する（551 と同じ方針）。
+    match tracker.posted(&event_id) {
+        // 内容に変更なし → 投稿しない。EEW は数秒間隔で続報が来るため、
+        // これがレート制限に対する主な歯止めになる。
+        Some((_, sig)) if sig == signature => {
+            info!(event_id = %event_id, "内容に変更がないため投稿をスキップ");
+        }
+        // 内容が変わった → 既存メッセージを差し替え（編集）。
+        Some((message_id, _)) => {
+            discord::edit_message(http, &config.webhook_url, &message_id, &payload, image).await?;
+            tracker.update_signature(&event_id, signature);
+            info!(event_id = %event_id, message_id = %message_id, "続報で内容が変わったため差し替えました");
+        }
+        // 第1報 → 新規投稿して message_id を記録する。
+        None => {
+            let message_id =
+                discord::post_message(http, &config.webhook_url, &payload, image).await?;
+            info!(event_id = %event_id, message_id = %message_id, "緊急地震速報を通知しました");
+            tracker.insert(&event_id, QuakePost {
+                signature,
+                message_id,
+            });
+        }
+    }
+
     Ok(())
 }
 
@@ -741,5 +816,91 @@ mod tests {
         assert_eq!(tracker.map.len(), SEEN_ID_CAPACITY);
         // 最初に入れたキーは退避されている。
         assert!(!tracker.map.contains_key("key-0"));
+    }
+
+    #[test]
+    fn eew_tracker_keeps_message_id_for_replacement() {
+        // 続報で差し替えられるよう、eventId から message_id を引けること。
+        let mut tracker = EewTracker::default();
+        assert!(tracker.posted("ev1").is_none());
+        tracker.insert("ev1", QuakePost {
+            signature: 1,
+            message_id: "m1".to_string(),
+        });
+        assert!(tracker.contains("ev1"));
+        assert_eq!(tracker.posted("ev1"), Some(("m1".to_string(), 1)));
+
+        // 差し替え後はシグネチャだけ更新し、message_id は保つ。
+        tracker.update_signature("ev1", 2);
+        assert_eq!(tracker.posted("ev1"), Some(("m1".to_string(), 2)));
+    }
+
+    #[test]
+    fn eew_tracker_evicts_oldest_over_capacity() {
+        let mut tracker = EewTracker::default();
+        for i in 0..(SEEN_ID_CAPACITY + 5) {
+            tracker.insert(&format!("ev-{i}"), QuakePost {
+                signature: 0,
+                message_id: String::new(),
+            });
+        }
+        assert_eq!(tracker.map.len(), SEEN_ID_CAPACITY);
+        assert!(!tracker.contains("ev-0"));
+    }
+
+    fn eew_payload(areas: Vec<crate::model::EewArea>, reason: &str) -> serde_json::Value {
+        let eew = Eew {
+            code: 556,
+            cancelled: false,
+            issue: crate::model::EewIssue {
+                event_id: "ev1".to_string(),
+                serial: "1".to_string(),
+                time: "2026/07/28 17:08:41".to_string(),
+            },
+            earthquake: Default::default(),
+            areas,
+        };
+        discord::build_eew_payload(&eew, reason, false, false)
+    }
+
+    fn eew_area(pref: &str, name: &str, scale_from: i32, scale_to: i32) -> crate::model::EewArea {
+        crate::model::EewArea {
+            pref: pref.to_string(),
+            name: name.to_string(),
+            scale_from,
+            scale_to,
+        }
+    }
+
+    #[test]
+    fn eew_signature_changes_when_forecast_is_revised() {
+        // 第1報「5弱程度以上」→ 第2報「5強」で内容が変わるため差し替えが走ること。
+        // シグネチャが同じだと引き下げが反映されず、古い内容が残ってしまう。
+        let first = eew_payload(
+            vec![eew_area("熊本", "熊本県熊本", 45, 99)],
+            "熊本県で予想最大震度5弱程度以上",
+        );
+        let second = eew_payload(
+            vec![eew_area("熊本", "熊本県熊本", 50, 50)],
+            "熊本県で予想最大震度5強",
+        );
+        assert_ne!(signature_of(&first), signature_of(&second));
+
+        // 同じ内容の再送では差し替えない（EEWは数秒間隔で続報が来るため）。
+        let resend = eew_payload(
+            vec![eew_area("熊本", "熊本県熊本", 50, 50)],
+            "熊本県で予想最大震度5強",
+        );
+        assert_eq!(signature_of(&second), signature_of(&resend));
+    }
+
+    #[test]
+    fn eew_summary_describes_forecast_without_threshold() {
+        // 基準を下回った続報の差し替え本文。しきい値と無関係に全地域から求める。
+        let areas = vec![
+            eew_area("熊本", "熊本県熊本", 50, 50),
+            eew_area("熊本", "熊本県球磨", 40, 40),
+        ];
+        assert_eq!(eew_summary(&areas), "熊本県で予想最大震度5強");
     }
 }

@@ -60,11 +60,16 @@ fn region_threshold(
 /// P2P地震情報のscale値を震度表記へ変換する。
 pub fn scale_label(scale: i32) -> &'static str {
     match scale {
+        // 0 は 556 の scaleFrom/scaleTo にのみ現れる（551 の scale・maxScale には無い）。
+        0 => "0",
         10 => "1",
         20 => "2",
         30 => "3",
         40 => "4",
         45 => "5弱",
+        // 46 は「震度5弱以上と推定」（揺れが強い等で震度情報が入手できていない地点）。
+        // 上限が不明なため下限のみを示す。
+        46 => "5弱以上",
         50 => "5強",
         55 => "6弱",
         60 => "6強",
@@ -73,27 +78,39 @@ pub fn scale_label(scale: i32) -> &'static str {
     }
 }
 
-/// 震度に応じた埋め込みカラー（揺れが強いほど赤系）。
+/// 震度に応じた埋め込みカラー。気象庁の震度分布図と同じ並び
+/// （1=灰系 → 2=水色 → 3=緑 → 4=黄 → 5弱以上=暖色 → 7=紫）で段階を分ける。
+/// `marker_rgb` と同じ配色にすること（`color_functions_agree` で検証している）。
 pub fn embed_color(scale: i32) -> u32 {
     match scale {
-        s if s >= 60 => 0x8B_00_00, // 6強・7: 濃い赤
+        s if s >= 70 => 0x8C_00_A0, // 7: 紫（6強と区別する）
+        s if s >= 60 => 0x8B_00_00, // 6強: 濃い赤
         55 => 0xE0_00_00,           // 6弱
         50 => 0xFF_44_00,           // 5強
-        45 => 0xFF_88_00,           // 5弱
+        45 | 46 => 0xFF_88_00,      // 5弱・5弱以上と推定（下限の色で示す）
         40 => 0xFF_C0_00,           // 4
-        _ => 0x33_99_FF,            // 3以下・不明
+        30 => 0x00_B0_50,           // 3: 緑
+        20 => 0x33_99_FF,           // 2: 水色
+        10 => 0x7C_8B_99,           // 1: 青灰（白地図に埋もれないよう灰は濃いめ）
+        0 => 0xC0_C8_D0,            // 0: 揺れを感じない
+        _ => 0xB0_B0_B0,            // 不明
     }
 }
 
-/// 地図マーカー色 (R, G, B)。
+/// 地図マーカー色 (R, G, B)。`embed_color` と同じ配色。
 pub fn marker_rgb(scale: i32) -> (u8, u8, u8) {
     match scale {
+        s if s >= 70 => (140, 0, 160),
         s if s >= 60 => (139, 0, 0),
         55 => (224, 0, 0),
         50 => (255, 68, 0),
-        45 => (255, 136, 0),
+        45 | 46 => (255, 136, 0),
         40 => (255, 192, 0),
-        _ => (51, 153, 255),
+        30 => (0, 176, 80),
+        20 => (51, 153, 255),
+        10 => (124, 139, 153),
+        0 => (192, 200, 208),
+        _ => (176, 176, 176),
     }
 }
 
@@ -212,7 +229,7 @@ fn prefs_at_scale(points: &[Point], scale: i32) -> Vec<&str> {
 fn eew_prefs_at_scale(areas: &[EewArea], scale: i32) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     for a in areas {
-        if a.scale_to == scale && !a.pref.is_empty() {
+        if eew_area_scale(a) == scale && !a.pref.is_empty() {
             let display = display_pref(&a.pref);
             if !out.contains(&display) {
                 out.push(display);
@@ -262,21 +279,28 @@ pub fn decide_eew(
     other_min_scale: i32,
 ) -> NotifyDecision {
     // 地方しきい値を満たす地域のうち、最大の予想震度スケールを求める。
+    //
+    // 「〜程度以上」(99) は上限が示されていない＝しきい値に達しうるため、下限が
+    // しきい値未満でも通知対象にする。緊急地震速報の第1報はこの形で来るので、
+    // 下限で足切りすると「大きな揺れが予想されるが確定していない」最も危険な報を
+    // 取りこぼす。556 自体が稀（発表がない週もある）なので通知過多にはならない。
     let mut best_scale: Option<i32> = None;
     for a in areas {
         let region = region_of(&a.pref);
         let threshold = region_threshold(region, region_min_scales, other_min_scale);
-        if a.scale_to >= threshold {
-            best_scale = Some(best_scale.map_or(a.scale_to, |s| s.max(a.scale_to)));
+        let scale = eew_area_scale(a);
+        if scale >= threshold || a.scale_to == SCALE_TO_UNBOUNDED {
+            best_scale = Some(best_scale.map_or(scale, |s| s.max(scale)));
         }
     }
 
     if let Some(scale) = best_scale {
         // 通知ポップアップでも場所が分かるよう、その予想最大震度の都府県名で示す。
         let place = format_place(&eew_prefs_at_scale(areas, scale));
+        let label = eew_scale_label(scale, is_unbounded_at(areas, scale));
         return NotifyDecision {
             notify: true,
-            reason: format!("{place}で予想最大震度{}", scale_label(scale)),
+            reason: format!("{place}で予想最大震度{label}"),
         };
     }
 
@@ -286,9 +310,61 @@ pub fn decide_eew(
     }
 }
 
-/// 緊急地震速報の予想最大震度（全地域の `scale_to` 最大）を返す。
+/// 556 の `scale_to` に入る「〜程度以上」を表す値。震度値ではなく、
+/// 上限が示されていない（下限の `scale_from` 以上）ことを意味する。第1報に付く。
+pub const SCALE_TO_UNBOUNDED: i32 = 99;
+
+/// 地域の予想震度の代表値を返す。`scale_to` が「〜程度以上」(99) の場合は上限が
+/// 示されていないため、下限の `scale_from` を代表値とする。
+///
+/// 99 を震度値として扱うと震度7(70)より大きい値になり、色の決定・しきい値判定・
+/// 予想最大震度の選定がすべて壊れる。
+pub fn eew_area_scale(area: &EewArea) -> i32 {
+    if area.scale_to == SCALE_TO_UNBOUNDED {
+        area.scale_from
+    } else {
+        area.scale_to
+    }
+}
+
+/// 予想最大震度とその都府県名を示す説明文（例: "熊本県で予想最大震度5強"）。
+///
+/// `decide_eew` の理由文と違い、しきい値と無関係に全地域から求める。通知後に
+/// 基準を下回った続報でも内容を示せるよう、差し替え時の本文に使う。
+pub fn eew_summary(areas: &[EewArea]) -> String {
+    let scale = eew_max_scale(areas);
+    let place = format_place(&eew_prefs_at_scale(areas, scale));
+    let label = eew_scale_label(scale, is_unbounded_at(areas, scale));
+    format!("{place}で予想最大震度{label}")
+}
+
+/// 緊急地震速報の予想最大震度（全地域の代表値の最大）を返す。
 pub fn eew_max_scale(areas: &[EewArea]) -> i32 {
-    areas.iter().map(|a| a.scale_to).max().unwrap_or(-1)
+    areas.iter().map(eew_area_scale).max().unwrap_or(-1)
+}
+
+/// 予想最大震度の表示ラベル。最大値の地域に上限なし(99)が含まれる場合は
+/// 「5弱程度以上」のように、下限であることが分かる表記にする。
+pub fn eew_max_scale_label(areas: &[EewArea]) -> String {
+    let max = eew_max_scale(areas);
+    eew_scale_label(max, is_unbounded_at(areas, max))
+}
+
+/// 代表値が `scale` の地域に、上限なし(99)のものが含まれるか。
+pub fn is_unbounded_at(areas: &[EewArea], scale: i32) -> bool {
+    areas
+        .iter()
+        .any(|a| eew_area_scale(a) == scale && a.scale_to == SCALE_TO_UNBOUNDED)
+}
+
+/// 予想震度の表示ラベル。`unbounded` なら「程度以上」を付けて下限であることを示す。
+/// 下限自体が不明(-1)の場合は「不明程度以上」にならないよう「不明」とする。
+pub fn eew_scale_label(scale: i32, unbounded: bool) -> String {
+    if unbounded && scale >= 0 {
+        format!("{}程度以上", scale_label(scale))
+    } else {
+        scale_label(scale).to_string()
+    }
 }
 
 #[cfg(test)]
@@ -319,6 +395,51 @@ mod tests {
         assert_eq!(region_of("宮城"), Some("東北"));
         assert_eq!(region_of("大阪府"), Some("近畿"));
         assert_eq!(region_of("ハワイ"), None);
+    }
+
+    #[test]
+    fn scale46_is_treated_as_5jaku() {
+        // 46(5弱以上と推定)は震源近傍で出やすい。45と同じ扱いにして、
+        // 「不明」扱い（震度3以下と同じ水色）に落ちないことを確認する。
+        assert_eq!(scale_label(46), "5弱以上");
+        assert_eq!(marker_rgb(46), marker_rgb(45));
+        assert_eq!(embed_color(46), embed_color(45));
+        assert_ne!(marker_rgb(46), marker_rgb(30));
+    }
+
+    /// 仕様上ありうる scale の全値。-1=不明、0 は 556 の scaleFrom/scaleTo のみ、
+    /// 46 は 551 の points のみ、99(〜程度以上) は震度値ではないので含めない。
+    const ALL_SCALES: &[i32] = &[-1, 0, 10, 20, 30, 40, 45, 46, 50, 55, 60, 70];
+
+    #[test]
+    fn shindo0_is_not_unknown() {
+        // 震度0(556の scaleFrom/scaleTo にのみ現れる)を「不明」と表示しない。
+        assert_eq!(scale_label(0), "0");
+        assert_ne!(marker_rgb(0), marker_rgb(-1));
+    }
+
+    #[test]
+    fn color_functions_agree() {
+        // embed_color と marker_rgb は同じ配色でなければならない。
+        for &s in ALL_SCALES {
+            let (r, g, b) = marker_rgb(s);
+            let packed = (u32::from(r) << 16) | (u32::from(g) << 8) | u32::from(b);
+            assert_eq!(embed_color(s), packed, "scale={s} で配色が食い違っている");
+        }
+    }
+
+    #[test]
+    fn each_scale_has_a_distinct_color() {
+        // 6強と7、震度1・2・3 がそれぞれ別色になっていること
+        // （45と46だけは意図的に同色なので除く）。
+        for &a in ALL_SCALES {
+            for &b in ALL_SCALES {
+                if a >= b || (a == 45 && b == 46) {
+                    continue;
+                }
+                assert_ne!(marker_rgb(a), marker_rgb(b), "scale {a} と {b} が同色");
+            }
+        }
     }
 
     #[test]
@@ -433,6 +554,59 @@ mod tests {
         assert!(!decide_eew(&[area("北海道", 40)], &kanto40(), 50).notify);
         // 関東外で予想震度5強 → 通知する
         assert!(decide_eew(&[area("北海道", 50)], &kanto40(), 50).notify);
+    }
+
+    /// `scale_to` が「〜程度以上」(99) の地域。第1報はこの形で来る。
+    fn area_unbounded(pref: &str, scale_from: i32) -> EewArea {
+        EewArea {
+            pref: pref.to_string(),
+            name: String::new(),
+            scale_from,
+            scale_to: SCALE_TO_UNBOUNDED,
+        }
+    }
+
+    #[test]
+    fn unbounded_scale_uses_lower_bound() {
+        // 99 は震度値ではないので、下限の scale_from を代表値にする。
+        // そのまま数値として扱うと震度7(70)を超え、色もしきい値判定も壊れる。
+        let a = area_unbounded("熊本", 45);
+        assert_eq!(eew_area_scale(&a), 45);
+        assert_eq!(marker_rgb(eew_area_scale(&a)), marker_rgb(45));
+        assert_ne!(marker_rgb(eew_area_scale(&a)), marker_rgb(70));
+    }
+
+    #[test]
+    fn unbounded_scale_is_labeled_as_lower_bound() {
+        // 「不明」ではなく下限が分かる表記にする。
+        let areas = vec![area_unbounded("熊本", 45), area_unbounded("熊本", 40)];
+        assert_eq!(eew_max_scale(&areas), 45);
+        assert_eq!(eew_max_scale_label(&areas), "5弱程度以上");
+        // 上限が確定している報では「程度以上」を付けない。
+        assert_eq!(eew_max_scale_label(&[area("熊本", 45)]), "5弱");
+    }
+
+    #[test]
+    fn unbounded_scale_notifies_even_below_threshold() {
+        // 上限が示されていない第1報は、下限がしきい値未満でも通知する。
+        // 下限で足切りすると、上限不明＝大きな揺れが予想される最も危険な報を取りこぼす。
+        let areas = vec![area_unbounded("熊本", 45)];
+        let d = decide_eew(&areas, &kanto40(), 50);
+        assert!(d.notify);
+        // 予想最大震度は下限で示す（99 を震度値として扱わない）。
+        assert_eq!(d.reason, "熊本県で予想最大震度5弱程度以上");
+    }
+
+    #[test]
+    fn bounded_scale_below_threshold_does_not_notify() {
+        // 上限が確定している報は従来どおりしきい値で判定する。
+        assert!(!decide_eew(&[area("熊本", 45)], &kanto40(), 50).notify);
+    }
+
+    #[test]
+    fn unknown_lower_bound_stays_unknown() {
+        // 下限自体が不明(-1)なら「不明程度以上」ではなく「不明」とする。
+        assert_eq!(eew_scale_label(-1, true), "不明");
     }
 
     #[test]
