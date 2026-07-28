@@ -323,6 +323,17 @@ pub fn eew_area_scale(area: &EewArea) -> i32 {
     }
 }
 
+/// 予想最大震度とその都府県名を示す説明文（例: "熊本県で予想最大震度5強"）。
+///
+/// `decide_eew` の理由文と違い、しきい値と無関係に全地域から求める。通知後に
+/// 基準を下回った続報でも内容を示せるよう、差し替え時の本文に使う。
+pub fn eew_summary(areas: &[EewArea]) -> String {
+    let scale = eew_max_scale(areas);
+    let place = format_place(&eew_prefs_at_scale(areas, scale));
+    let label = eew_scale_label(scale, is_unbounded_at(areas, scale));
+    format!("{place}で予想最大震度{label}")
+}
+
 /// 緊急地震速報の予想最大震度（全地域の代表値の最大）を返す。
 pub fn eew_max_scale(areas: &[EewArea]) -> i32 {
     areas.iter().map(eew_area_scale).max().unwrap_or(-1)
