@@ -22,7 +22,7 @@ use tracing::{error, info, warn};
 
 use crate::config::Config;
 use crate::intensity::{decide, decide_eew, eew_max_scale, eew_summary, tsunami_grade_rank};
-use crate::model::{Eew, Envelope, JmaQuake, Tsunami};
+use crate::model::{Eew, Envelope, JmaQuake, Point, Tsunami};
 
 /// 地震情報メッセージの code。
 const CODE_JMA_QUAKE: i32 = 551;
@@ -77,6 +77,51 @@ struct QuakeEntry {
     /// 削除後に震度速報の続報が届いても再投稿しないための印。`prompt` を None に
     /// 戻すだけだと、続報が初報として投稿され直してしまう。
     prompt_removed: bool,
+    /// 震度速報が伝えた都道府県ごとの最大震度。詳報を消してよいかの判定に使う。
+    prompt_pref_max: HashMap<String, i32>,
+}
+
+/// 観測点から都道府県ごとの最大震度を求める。
+fn pref_max_scales(points: &[Point]) -> HashMap<String, i32> {
+    let mut out: HashMap<String, i32> = HashMap::new();
+    for p in points {
+        if p.pref.is_empty() {
+            continue;
+        }
+        let entry = out.entry(p.pref.clone()).or_insert(p.scale);
+        *entry = (*entry).max(p.scale);
+    }
+    out
+}
+
+/// 詳報の投稿にともなって震度速報を削除してよいか。
+///
+/// 震度速報の発震時刻は震源決定前の暫定値で、確定時に1分ほど修正されることがある。
+/// そのため群発地震では、修正前の時刻が別地震の確定時刻と一致し、無関係な詳報と
+/// 発生時刻キーが衝突しうる（実データ: 熊本 2026/07/28 23:01 の震度速報は最大震度4
+/// だが、同時刻には最大震度2の別地震が実在し、その詳報が同じキーになる）。
+///
+/// そこで、同一地震とみなす条件を2つ課す。
+/// 1. 速報が挙げた都道府県がすべて詳報にも現れる（震度は問わない）
+/// 2. 詳報の最大震度が速報の最大震度を下回らない
+///
+/// 都道府県ごとに震度まで同等以上を求めると厳しすぎる。詳報は集計途中で出るため
+/// 一部の県の震度が速報より低く出ることがあり、実データでも 2026/07/28 16:27 の
+/// 最大震度7で、岡山県だけが速報の震度3に対し初回詳報で震度2だった。
+///
+/// 判定材料がない（速報・詳報のどちらかに観測点がない）場合は消さない。
+fn should_remove_prompt(prompt_pref_max: &HashMap<String, i32>, detail_points: &[Point]) -> bool {
+    let detail_pref_max = pref_max_scales(detail_points);
+    if prompt_pref_max.is_empty() || detail_pref_max.is_empty() {
+        return false;
+    }
+    if !prompt_pref_max
+        .keys()
+        .all(|pref| detail_pref_max.contains_key(pref))
+    {
+        return false;
+    }
+    detail_pref_max.values().max() >= prompt_pref_max.values().max()
 }
 
 /// 地震情報(551)の投稿状態を発生時刻ごとに保持する。容量超過で古い順に退避する。
@@ -556,6 +601,11 @@ async fn handle_quake(
         return Ok(());
     }
 
+    // 速報が伝えた震度を控える。詳報を消してよいかの判定に使う。
+    if is_prompt {
+        entry.prompt_pref_max = pref_max_scales(&quake.points);
+    }
+
     // 速報・詳報それぞれのスロットを取り出す。
     let slot = if is_prompt {
         &mut entry.prompt
@@ -591,12 +641,17 @@ async fn handle_quake(
         }
     }
 
-    // 詳報は震度速報を包含するため、詳報を出せたら速報側は消して重複を残さない。
+    // 詳報が速報を包含していれば、速報側は消して重複を残さない。
     // 削除に失敗したときは記録を残したままにして、以降の続報で編集され続けるようにする。
     if posted_first_detail {
         let entry = tracker.entry(&key);
-        match entry.prompt.as_ref().map(|p| p.message_id.clone()) {
-            Some(message_id) => {
+        if let Some(message_id) = entry.prompt.as_ref().map(|p| p.message_id.clone()) {
+            if !should_remove_prompt(&entry.prompt_pref_max, &quake.points) {
+                warn!(
+                    message_id = %message_id,
+                    "詳報が震度速報の震度を再現していないため、別地震とみなして速報を残します"
+                );
+            } else {
                 match discord::delete_message(http, &config.webhook_url, &message_id).await {
                     Ok(()) => {
                         entry.prompt = None;
@@ -608,8 +663,6 @@ async fn handle_quake(
                     }
                 }
             }
-            // 震度速報が未投稿でも印は立てる。遅れて届いた速報を詳報の後に出さないため。
-            None => entry.prompt_removed = true,
         }
     }
 
@@ -865,6 +918,93 @@ mod tests {
         let entry = tracker.entry(key);
         assert!(entry.prompt.is_none());
         assert!(entry.prompt_removed);
+    }
+
+    fn point(pref: &str, scale: i32) -> Point {
+        Point {
+            pref: pref.to_string(),
+            addr: String::new(),
+            scale,
+        }
+    }
+
+    #[test]
+    fn removes_prompt_when_detail_reproduces_every_pref() {
+        // 熊本 2026/07/28 17:08 の実データ。速報の各県の震度を詳報が同等以上で再現している。
+        let prompt = pref_max_scales(&[
+            point("熊本県", 45),
+            point("長崎県", 30),
+            point("鹿児島県", 30),
+        ]);
+        let detail = [
+            point("熊本県", 45),
+            point("熊本県", 30),
+            point("長崎県", 30),
+            point("鹿児島県", 40),
+            point("宮崎県", 20),
+        ];
+        assert!(should_remove_prompt(&prompt, &detail));
+    }
+
+    #[test]
+    fn keeps_prompt_when_detail_max_scale_is_lower() {
+        // 熊本 2026/07/28 23:01 の実データ。この時刻には最大震度2の別地震が実在し、
+        // その詳報が、発震時刻を修正される前の震度4の速報と同じキーになる。
+        // 対象県はすべて重なるため、弾けるのは最大震度の比較だけ。
+        let prompt = pref_max_scales(&[point("熊本県", 40), point("長崎県", 30)]);
+        let detail = [
+            point("熊本県", 20),
+            point("長崎県", 20),
+            point("宮崎県", 10),
+            point("鹿児島県", 20),
+        ];
+        assert!(!should_remove_prompt(&prompt, &detail));
+    }
+
+    #[test]
+    fn removes_prompt_when_only_a_minor_pref_lags_behind() {
+        // 熊本 2026/07/28 16:27（最大震度7）の実データ。詳報は集計途中のため
+        // 岡山県だけ速報の震度3に対し震度2だが、最大震度7は保たれている。
+        // 県ごとに震度まで同等以上を求めると、この重複が消えなくなる。
+        let prompt = pref_max_scales(&[
+            point("熊本県", 70),
+            point("長崎県", 50),
+            point("岡山県", 30),
+        ]);
+        let detail = [
+            point("熊本県", 70),
+            point("長崎県", 50),
+            point("岡山県", 20),
+        ];
+        assert!(should_remove_prompt(&prompt, &detail));
+    }
+
+    #[test]
+    fn keeps_prompt_when_detail_omits_a_pref() {
+        // 速報にあった県が詳報に出てこないなら、同一地震とは判断しない。
+        let prompt = pref_max_scales(&[point("熊本県", 40), point("長崎県", 30)]);
+        let detail = [point("熊本県", 40)];
+        assert!(!should_remove_prompt(&prompt, &detail));
+    }
+
+    #[test]
+    fn keeps_prompt_without_comparable_points() {
+        // 判定材料がなければ消さない。
+        assert!(!should_remove_prompt(&HashMap::new(), &[point("熊本県", 40)]));
+        let prompt = pref_max_scales(&[point("熊本県", 40)]);
+        assert!(!should_remove_prompt(&prompt, &[]));
+    }
+
+    #[test]
+    fn pref_max_scales_takes_the_highest_per_pref() {
+        let m = pref_max_scales(&[
+            point("熊本県", 20),
+            point("熊本県", 45),
+            point("熊本県", 30),
+            point("", 70), // 県名なしは対象外
+        ]);
+        assert_eq!(m.get("熊本県"), Some(&45));
+        assert_eq!(m.len(), 1);
     }
 
     #[test]
