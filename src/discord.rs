@@ -434,6 +434,24 @@ pub async fn edit_message(
     Ok(())
 }
 
+/// 既存の Webhook メッセージを削除する。
+///
+/// 詳報（各地の震度など）を投稿したあと、不要になった震度速報を取り除くために使う。
+pub async fn delete_message(
+    client: &reqwest::Client,
+    webhook_url: &str,
+    message_id: &str,
+) -> Result<()> {
+    let url = format!("{webhook_url}/messages/{message_id}");
+    let response = client
+        .delete(&url)
+        .send()
+        .await
+        .context("Webhook 削除に失敗")?;
+    check_response(response).await?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

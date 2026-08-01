@@ -68,10 +68,15 @@ struct QuakePost {
 /// 同一地震（発生時刻キー）について、速報・詳報それぞれの投稿状態を別管理する。
 #[derive(Default)]
 struct QuakeEntry {
-    /// 震度速報（ScalePrompt）の投稿状態。
+    /// 震度速報（ScalePrompt）の投稿状態。削除後は None。
     prompt: Option<QuakePost>,
     /// 詳報（各地の震度など）の投稿状態。
     detail: Option<QuakePost>,
+    /// 詳報の投稿にともなって震度速報を削除済みか。
+    ///
+    /// 削除後に震度速報の続報が届いても再投稿しないための印。`prompt` を None に
+    /// 戻すだけだと、続報が初報として投稿され直してしまう。
+    prompt_removed: bool,
 }
 
 /// 地震情報(551)の投稿状態を発生時刻ごとに保持する。容量超過で古い順に退避する。
@@ -543,13 +548,23 @@ async fn handle_quake(
         return Ok(());
     }
 
-    // 速報・詳報それぞれのスロットを取り出す。
     let entry = tracker.entry(&key);
+
+    // 詳報の投稿時に削除済みなら、震度速報の続報が届いても投稿し直さない。
+    if is_prompt && entry.prompt_removed {
+        info!(kind, "詳報を投稿済みのため震度速報は投稿しません");
+        return Ok(());
+    }
+
+    // 速報・詳報それぞれのスロットを取り出す。
     let slot = if is_prompt {
         &mut entry.prompt
     } else {
         &mut entry.detail
     };
+
+    // 詳報を新規投稿したか。震度速報を削除してよいかの判定に使う。
+    let mut posted_first_detail = false;
 
     match slot {
         // 内容に変更なし → 投稿しない。
@@ -572,6 +587,29 @@ async fn handle_quake(
                 signature,
                 message_id,
             });
+            posted_first_detail = !is_prompt;
+        }
+    }
+
+    // 詳報は震度速報を包含するため、詳報を出せたら速報側は消して重複を残さない。
+    // 削除に失敗したときは記録を残したままにして、以降の続報で編集され続けるようにする。
+    if posted_first_detail {
+        let entry = tracker.entry(&key);
+        match entry.prompt.as_ref().map(|p| p.message_id.clone()) {
+            Some(message_id) => {
+                match discord::delete_message(http, &config.webhook_url, &message_id).await {
+                    Ok(()) => {
+                        entry.prompt = None;
+                        entry.prompt_removed = true;
+                        info!(message_id = %message_id, "詳報を投稿したため震度速報を削除しました");
+                    }
+                    Err(e) => {
+                        warn!(error = %e, message_id = %message_id, "震度速報の削除に失敗しました");
+                    }
+                }
+            }
+            // 震度速報が未投稿でも印は立てる。遅れて届いた速報を詳報の後に出さないため。
+            None => entry.prompt_removed = true,
         }
     }
 
@@ -805,6 +843,28 @@ mod tests {
         let entry = tracker.entry(key);
         assert!(entry.prompt.is_some());
         assert!(entry.detail.is_none());
+    }
+
+    #[test]
+    fn tracker_marks_prompt_removed_after_detail() {
+        // 詳報の投稿で速報を削除したあとは、速報の続報が来ても再投稿しない印が残ること。
+        let mut tracker = QuakeTracker::default();
+        let key = "2026/06/28 05:21:00";
+        {
+            let entry = tracker.entry(key);
+            entry.prompt = Some(QuakePost {
+                signature: 1,
+                message_id: "p".to_string(),
+            });
+        }
+        {
+            let entry = tracker.entry(key);
+            entry.prompt = None;
+            entry.prompt_removed = true;
+        }
+        let entry = tracker.entry(key);
+        assert!(entry.prompt.is_none());
+        assert!(entry.prompt_removed);
     }
 
     #[test]
