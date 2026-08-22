@@ -1,7 +1,11 @@
 //! Discord Webhook への通知。embed と地図画像(添付)を送信する。
 
+use std::time::Duration;
+
 use anyhow::{Context, Result};
+use reqwest::StatusCode;
 use serde_json::{json, Value};
+use tracing::warn;
 
 use crate::intensity::{
     embed_color, eew_area_scale, eew_max_scale, eew_max_scale_label, eew_scale_label,
@@ -11,6 +15,16 @@ use crate::intensity::{
 use crate::model::{Eew, JmaQuake, Point, Tsunami};
 
 const MAP_FILE_NAME: &str = "quake.webp";
+
+/// 送信を諦めるまでの試行回数。
+///
+/// ネットワーク復帰の直後などは最初の1回だけ失敗することがある。そこで通知を落とすと
+/// 二度と出ないため（緊急地震速報の第1報は特に取り返しがつかない）、数回だけ試し直す。
+const MAX_ATTEMPTS: u32 = 3;
+/// 再試行までの最初の待ち時間。
+const RETRY_WAIT: Duration = Duration::from_millis(500);
+/// 再試行の待ち時間の上限。これより長く待つ必要があるなら通知として手遅れなので諦める。
+const RETRY_WAIT_MAX: Duration = Duration::from_secs(5);
 
 /// 受信した地震情報から Discord embed の payload を組み立てる。
 ///
@@ -358,28 +372,74 @@ fn build_request(
     }
 }
 
-/// レスポンスのステータスを検証し、成功時のみ本文を返す。
-async fn check_response(response: reqwest::Response) -> Result<String> {
-    let status = response.status();
-    let body = response.text().await.unwrap_or_default();
-    if !status.is_success() {
-        anyhow::bail!("Webhook がエラー応答: {status} {body}");
+/// レート制限時に Discord が指示してくる待ち時間（`Retry-After`、秒）。
+fn retry_after(response: &reqwest::Response) -> Option<Duration> {
+    let raw = response
+        .headers()
+        .get(reqwest::header::RETRY_AFTER)?
+        .to_str()
+        .ok()?;
+    let secs: f64 = raw.trim().parse().ok()?;
+    (secs.is_finite() && secs >= 0.0).then(|| Duration::from_secs_f64(secs))
+}
+
+/// リクエストを送信し、一時的な失敗だけ試し直して成功時の本文を返す。
+///
+/// 再試行するのは接続エラー・タイムアウトと、429（レート制限）・5xx のみ。
+/// それ以外の 4xx は投げ直しても結果が変わらないため即座に諦める。
+/// `new_request` は試行ごとにリクエストを組み直すために毎回呼ばれる。
+async fn send_with_retry(
+    new_request: impl Fn() -> reqwest::RequestBuilder,
+    payload: &Value,
+    image: Option<Vec<u8>>,
+    what: &'static str,
+) -> Result<String> {
+    let mut attempt: u32 = 1;
+    let mut wait = RETRY_WAIT;
+    loop {
+        let last = attempt >= MAX_ATTEMPTS;
+        let request = build_request(new_request(), payload, image.clone())?;
+        match request.send().await {
+            Ok(response) => {
+                let status = response.status();
+                let after = retry_after(&response);
+                let body = response.text().await.unwrap_or_default();
+                if status.is_success() {
+                    return Ok(body);
+                }
+                let retryable = status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error();
+                if !retryable || last {
+                    anyhow::bail!("{what}がエラー応答: {status} {body}");
+                }
+                if let Some(after) = after {
+                    if after > RETRY_WAIT_MAX {
+                        anyhow::bail!("{what}がレート制限: {after:?} の待機が必要なため諦めます");
+                    }
+                    wait = after;
+                }
+                warn!(%status, attempt, wait_ms = wait.as_millis() as u64, "{what}に失敗。再試行します");
+            }
+            Err(e) if last => return Err(anyhow::Error::new(e).context(what)),
+            Err(e) => {
+                warn!(error = %e, attempt, wait_ms = wait.as_millis() as u64, "{what}に失敗。再試行します");
+            }
+        }
+        tokio::time::sleep(wait).await;
+        wait = (wait * 3).min(RETRY_WAIT_MAX);
+        attempt += 1;
     }
-    Ok(body)
 }
 
 /// Webhook に送信する。`image` がある場合は multipart で画像を添付する。
 ///
-/// message_id を必要としない通知（緊急地震速報・津波予報）向け。
+/// message_id を必要としない通知（緊急地震速報の取消・津波予報）向け。
 pub async fn send(
     client: &reqwest::Client,
     webhook_url: &str,
     payload: &Value,
     image: Option<Vec<u8>>,
 ) -> Result<()> {
-    let request = build_request(client.post(webhook_url), payload, image)?;
-    let response = request.send().await.context("Webhook 送信に失敗")?;
-    check_response(response).await?;
+    send_with_retry(|| client.post(webhook_url), payload, image, "Webhook 送信").await?;
     Ok(())
 }
 
@@ -393,9 +453,7 @@ pub async fn post_message(
     image: Option<Vec<u8>>,
 ) -> Result<String> {
     let url = format!("{webhook_url}?wait=true");
-    let request = build_request(client.post(&url), payload, image)?;
-    let response = request.send().await.context("Webhook 投稿に失敗")?;
-    let body = check_response(response).await?;
+    let body = send_with_retry(|| client.post(&url), payload, image, "Webhook 投稿").await?;
     let value: Value = serde_json::from_str(&body).context("Webhook 応答の解析に失敗")?;
     value
         .get("id")
@@ -428,9 +486,7 @@ pub async fn edit_message(
         obj.insert("attachments".to_string(), attachments);
     }
 
-    let request = build_request(client.patch(&url), &payload, image)?;
-    let response = request.send().await.context("Webhook 編集に失敗")?;
-    check_response(response).await?;
+    send_with_retry(|| client.patch(&url), &payload, image, "Webhook 編集").await?;
     Ok(())
 }
 

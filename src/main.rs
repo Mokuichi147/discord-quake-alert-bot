@@ -13,10 +13,11 @@ mod model;
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use futures_util::StreamExt;
+use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
 use tracing::{error, info, warn};
 
@@ -30,6 +31,45 @@ const CODE_JMA_QUAKE: i32 = 551;
 const CODE_EEW: i32 = 556;
 /// 津波予報メッセージの code。
 const CODE_TSUNAMI: i32 = 552;
+
+/// 無通信をどれだけ許容するか。これを超えたら接続が死んだとみなして張り直す。
+///
+/// サーバは実測でおよそ54秒ごとに ping を送ってくるため、正常な接続がこの時間だけ
+/// 黙ることはない。逆にこの上限が無いと、ネットワークが黙って切れた（FIN も RST も
+/// 届かない）場合に読み取りが永久に待ち続け、二度と通知が出ないまま生き残ってしまう。
+const IDLE_TIMEOUT: Duration = Duration::from_secs(75);
+
+/// 接続（DNS・TCP・TLS・WebSocket ハンドシェイク）を諦めるまでの時間。
+/// ここにも上限が無いと、経路が死んでいるときに接続処理のまま止まりうる。
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// 再接続バックオフの下限。正常な切断でも最低これだけは空け、連続切断時の暴走を防ぐ。
+const BACKOFF_MIN: Duration = Duration::from_millis(500);
+/// 再接続バックオフの上限。緊急地震速報は数十秒が勝負なので、長く待たない。
+const BACKOFF_MAX: Duration = Duration::from_secs(8);
+/// この時間つながっていられたら、次の切断ではバックオフを下限に戻す。
+const STABLE_CONNECTION: Duration = Duration::from_secs(60);
+
+/// 接続が 429（レート制限）で拒否されたときの待ち時間。
+///
+/// このサーバは1つの IP から同時に1接続しか受け付けず、切れたセッションが解放される
+/// までに十数秒かかる（実測）。解放前に叩き直しても弾かれ続けるだけなので、
+/// 通常のバックオフとは別に、解放を待つ時間を空ける。
+const BACKOFF_RATE_LIMITED: Duration = Duration::from_secs(10);
+
+/// 切断中の取りこぼしを履歴 API で確認するときの制限時間。
+/// 確認は再接続の前に行うため、長引かせると復帰そのものが遅れる。
+const CATCH_UP_TIMEOUT: Duration = Duration::from_secs(8);
+
+/// ワーカーの待ち行列の長さ。通常の受信頻度に対して十分な余裕を取る。
+const WORKER_QUEUE_CAPACITY: usize = 256;
+
+/// 地図生成（タイル取得を含む）を諦めるまでの時間。
+///
+/// タイル取得は同期通信でリクエスト全体のタイムアウトを持たないため、タイルサーバや
+/// 経路が不調だと数十秒かかりうる。速報性を地図より優先し、間に合わなければ
+/// テキストのみで通知する。
+const MAP_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// 重複抑制のため記録する ID の上限。
 const SEEN_ID_CAPACITY: usize = 256;
@@ -197,40 +237,114 @@ async fn main() -> Result<()> {
         return run_test(&config, &http).await;
     }
 
-    // 重複報・再送を抑制する状態。再接続をまたいで保持する。
-    let mut dedup = DedupState::default();
+    // 受信と通知処理を分ける。受信ループは届いたテキストをワーカーへ渡すだけにし、
+    // 地図生成や Discord 送信で止まらないようにする（理由は run_once を参照）。
+    // 重複抑制の状態は種別ごとに独立しているため、緊急地震速報だけ別ワーカーにしても
+    // 支障はない。地図生成の重い地震情報(551)に速報が待たされるのを避ける。
+    let eew_tx = spawn_worker(config.clone(), http.clone(), "eew");
+    let other_tx = spawn_worker(config.clone(), http.clone(), "quake");
 
-    // 切断されても再接続し続ける。失敗時は指数バックオフ（最大60秒）。
-    let mut backoff = Duration::from_secs(1);
+    // 最後に処理した地震情報(551)の id。切断中に流れた分を履歴から拾い直す基準にする。
+    let mut cursor: Option<String> = None;
+
+    // 切断されても再接続し続ける。
+    let mut backoff = BACKOFF_MIN;
     loop {
-        match run_once(&config, &http, &mut dedup).await {
+        let started = Instant::now();
+        // 接続する前に取りこぼしを拾う。接続後に取りに行くと、その間 ping に
+        // 応答できず接続を失いかねない。
+        catch_up(&http, &other_tx, &mut cursor).await;
+        let result = run_once(&config, &eew_tx, &other_tx, &mut cursor).await;
+        let rate_limited = match &result {
             Ok(()) => {
                 warn!("WebSocket 接続が終了しました。再接続します");
-                backoff = Duration::from_secs(1);
+                false
             }
             Err(e) => {
-                error!(error = %e, backoff_secs = backoff.as_secs(), "接続エラー。再接続します");
-                tokio::time::sleep(backoff).await;
-                backoff = (backoff * 2).min(Duration::from_secs(60));
+                error!(error = %e, "接続エラー。再接続します");
+                is_rate_limited(e)
             }
+        };
+
+        // しばらく保っていた接続の切断は一時的なものとみなし、待ち時間を戻す。
+        if started.elapsed() >= STABLE_CONNECTION {
+            backoff = BACKOFF_MIN;
         }
+        // 正常終了でも必ず間隔を空ける。空けないと、接続直後に切られ続ける状況で
+        // 再接続を延々と繰り返してしまう。
+        let wait = if rate_limited {
+            BACKOFF_RATE_LIMITED
+        } else {
+            backoff
+        };
+        info!(wait_ms = wait.as_millis() as u64, rate_limited, "再接続まで待機します");
+        tokio::time::sleep(wait).await;
+        backoff = next_backoff(backoff);
     }
 }
 
-/// 1回の WebSocket セッションを処理する。正常切断で Ok を返す。
-async fn run_once(config: &Config, http: &reqwest::Client, dedup: &mut DedupState) -> Result<()> {
-    let (ws_stream, _resp) = tokio_tungstenite::connect_async(config.ws_url.as_str()).await?;
-    info!("WebSocket に接続しました");
-    let (_write, mut read) = ws_stream.split();
+/// 次の再接続までの待ち時間。上限まで倍々に伸ばす。
+fn next_backoff(current: Duration) -> Duration {
+    (current * 2).min(BACKOFF_MAX)
+}
 
-    while let Some(message) = read.next().await {
-        let message = message?;
-        match message {
-            Message::Text(text) => {
-                if let Err(e) = handle_text(config, http, &text, false, dedup).await {
-                    error!(error = %e, "メッセージ処理に失敗");
-                }
+/// 接続がレート制限（HTTP 429）で拒否されたか。
+fn is_rate_limited(error: &anyhow::Error) -> bool {
+    use tokio_tungstenite::tungstenite::{http::StatusCode, Error};
+    matches!(
+        error.downcast_ref::<Error>(),
+        Some(Error::Http(resp)) if resp.status() == StatusCode::TOO_MANY_REQUESTS
+    )
+}
+
+/// 受信テキストを1件ずつ処理するワーカーを起動し、その送信口を返す。
+///
+/// 通知処理（地図生成・Discord 送信）は受信ループではなくこちらで行う。
+fn spawn_worker(config: Config, http: reqwest::Client, kind: &'static str) -> mpsc::Sender<String> {
+    let (tx, mut rx) = mpsc::channel::<String>(WORKER_QUEUE_CAPACITY);
+    tokio::spawn(async move {
+        // 重複報・再送を抑制する状態。再接続をまたいで保持する。
+        let mut dedup = DedupState::default();
+        while let Some(text) = rx.recv().await {
+            if let Err(e) = handle_text(&config, &http, &text, false, &mut dedup).await {
+                error!(error = %e, kind, "メッセージ処理に失敗");
             }
+        }
+    });
+    tx
+}
+
+/// 1回の WebSocket セッションを処理する。サーバからの切断で Ok を返す。
+///
+/// この関数の中では通知処理を行わず、受信したテキストをワーカーへ渡すだけにする。
+/// サーバは ping への pong を返さない接続を数秒で切るが、pong は読み取りの延長で
+/// 送られるため、ここで時間のかかる処理をすると pong が間に合わず切断される。
+async fn run_once(
+    config: &Config,
+    eew_tx: &mpsc::Sender<String>,
+    other_tx: &mpsc::Sender<String>,
+    cursor: &mut Option<String>,
+) -> Result<()> {
+    let connect = tokio_tungstenite::connect_async(config.ws_url.as_str());
+    let (mut ws_stream, _resp) = tokio::time::timeout(CONNECT_TIMEOUT, connect)
+        .await
+        .map_err(|_| anyhow!("接続が {} 秒以内に確立しませんでした", CONNECT_TIMEOUT.as_secs()))??;
+    info!("WebSocket に接続しました");
+
+    loop {
+        // 無通信が続く接続は死んでいるとみなす。ネットワークが黙って切れると
+        // FIN も RST も届かず、読み取りは永久に待ち続けてしまう。
+        let next = tokio::time::timeout(IDLE_TIMEOUT, ws_stream.next())
+            .await
+            .map_err(|_| {
+                anyhow!(
+                    "{} 秒間受信がありません。接続が切れたとみなします",
+                    IDLE_TIMEOUT.as_secs()
+                )
+            })?;
+        let Some(message) = next else { break };
+        match message? {
+            Message::Text(text) => dispatch(&text, eew_tx, other_tx, cursor),
             Message::Ping(_) | Message::Pong(_) => {}
             Message::Close(_) => {
                 info!("サーバから切断通知を受信");
@@ -240,6 +354,135 @@ async fn run_once(config: &Config, http: &reqwest::Client, dedup: &mut DedupStat
         }
     }
     Ok(())
+}
+
+/// 受信テキストを code で振り分けてワーカーへ渡す。
+///
+/// 待ち行列が詰まっている場合は捨てて記録する。受信ループを止めると pong が遅れ、
+/// 接続ごと失って以降の続報も落とすため、待たずに次の受信へ進むことを優先する。
+fn dispatch(
+    text: &str,
+    eew_tx: &mpsc::Sender<String>,
+    other_tx: &mpsc::Sender<String>,
+    cursor: &mut Option<String>,
+) {
+    // 想定外のフォーマットは無視する。
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(text) else {
+        return;
+    };
+    let Some(code) = value.get("code").and_then(serde_json::Value::as_i64) else {
+        return;
+    };
+    let code = code as i32;
+    let tx = match code {
+        CODE_EEW => eew_tx,
+        CODE_JMA_QUAKE | CODE_TSUNAMI => other_tx,
+        _ => return,
+    };
+    match tx.try_send(text.to_string()) {
+        Ok(()) => {
+            // 渡せた分だけ基準を進める。渡せなかったものは次の再接続で拾い直す。
+            if code == CODE_JMA_QUAKE {
+                if let Some(id) = message_id(&value) {
+                    *cursor = Some(id.to_string());
+                }
+            }
+        }
+        Err(mpsc::error::TrySendError::Full(_)) => {
+            error!(code, "処理が追いつかずメッセージを破棄しました");
+        }
+        // ワーカーが落ちている。このまま動き続けても二度と通知できないので、
+        // 黙って生き残らずに終了し、プロセス管理（systemd 等）に再起動させる。
+        Err(mpsc::error::TrySendError::Closed(_)) => {
+            error!(code, "通知ワーカーが停止しています。プロセスを終了します");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// メッセージの id。WebSocket は `_id`、履歴 API は `id` と名前が違うが値は同じ。
+fn message_id(value: &serde_json::Value) -> Option<&str> {
+    value
+        .get("_id")
+        .or_else(|| value.get("id"))
+        .and_then(serde_json::Value::as_str)
+}
+
+/// 履歴（新しい順）から `previous` より後に流れたものを、古い順に取り出す。
+///
+/// `previous` が見つからない場合は全件を返す（履歴の範囲を超えて切れていた場合）。
+fn missed_since<'a>(items: &'a [serde_json::Value], previous: &str) -> Vec<&'a serde_json::Value> {
+    let mut missed: Vec<&serde_json::Value> = items
+        .iter()
+        .take_while(|v| message_id(v) != Some(previous))
+        .collect();
+    missed.reverse();
+    missed
+}
+
+/// 切断中に流れた地震情報(551)を履歴 API から拾い直してワーカーへ渡す。
+///
+/// 起動直後（`cursor` が None）は基準を記録するだけで何も通知しない。
+/// そうしないと、起動のたびに過去の地震をまとめて投稿してしまう。
+///
+/// 緊急地震速報(556)は対象にしない。揺れる前に知らせるための情報で、
+/// 揺れが終わった後に流すと誤解を招くため。
+async fn catch_up(
+    http: &reqwest::Client,
+    tx: &mpsc::Sender<String>,
+    cursor: &mut Option<String>,
+) {
+    let items = match tokio::time::timeout(CATCH_UP_TIMEOUT, fetch_history(http, HISTORY_URL)).await
+    {
+        Ok(Ok(items)) => items,
+        Ok(Err(e)) => {
+            warn!(error = %e, "取りこぼしの確認に失敗しました");
+            return;
+        }
+        Err(_) => {
+            warn!("取りこぼしの確認が時間内に終わりませんでした");
+            return;
+        }
+    };
+
+    // 履歴は新しい順に並んでいる。
+    let Some(newest) = items.first().and_then(message_id).map(str::to_string) else {
+        return;
+    };
+    let Some(previous) = cursor.clone() else {
+        *cursor = Some(newest);
+        info!("起動時の基準を記録しました（起動前の地震は通知しません）");
+        return;
+    };
+    if previous == newest {
+        return;
+    }
+
+    let missed = missed_since(&items, &previous);
+    if missed.len() == items.len() {
+        warn!(count = missed.len(), "取りこぼしが履歴の範囲を超えている可能性があります");
+    }
+    info!(count = missed.len(), "切断中に流れた地震情報を拾い直します");
+    for item in missed {
+        if tx.try_send(item.to_string()).is_err() {
+            // 基準は進めない。次の再接続でもう一度拾い直す。
+            warn!("拾い直した地震情報をワーカーへ渡せませんでした");
+            return;
+        }
+    }
+    *cursor = Some(newest);
+}
+
+/// 履歴 API から JSON 配列を取得する。
+async fn fetch_history(http: &reqwest::Client, url: &str) -> Result<Vec<serde_json::Value>> {
+    let body = http
+        .get(url)
+        .send()
+        .await?
+        .error_for_status()?
+        .text()
+        .await?;
+    Ok(serde_json::from_str(&body)?)
 }
 
 /// 過去の地震情報 (P2P地震情報 REST API) のエンドポイント。
@@ -253,14 +496,7 @@ const HISTORY_TSUNAMI_URL: &str = "https://api.p2pquake.net/v2/history?codes=552
 /// 本番と同じ経路 (handle_text) で Discord へ送信して終了する。
 async fn run_test(config: &Config, http: &reqwest::Client) -> Result<()> {
     info!("テストモード: 過去の地震情報を取得します");
-    let body = http
-        .get(HISTORY_URL)
-        .send()
-        .await?
-        .error_for_status()?
-        .text()
-        .await?;
-    let items: Vec<serde_json::Value> = serde_json::from_str(&body)?;
+    let items = fetch_history(http, HISTORY_URL).await?;
     info!(count = items.len(), "履歴を取得しました");
 
     // 通知条件を満たす最新の地震を1件だけ送信する。
@@ -300,14 +536,7 @@ async fn run_test(config: &Config, http: &reqwest::Client) -> Result<()> {
 /// 使う観測県マーカーマップの経路を確認できない。本コマンドはその経路を狙って検証する。
 async fn run_test_prompt(config: &Config, http: &reqwest::Client) -> Result<()> {
     info!("テストモード: 過去の地震情報から震源未確定の報を取得します");
-    let body = http
-        .get(HISTORY_URL)
-        .send()
-        .await?
-        .error_for_status()?
-        .text()
-        .await?;
-    let items: Vec<serde_json::Value> = serde_json::from_str(&body)?;
+    let items = fetch_history(http, HISTORY_URL).await?;
     info!(count = items.len(), "履歴を取得しました");
 
     for item in &items {
@@ -351,14 +580,7 @@ async fn run_test_prompt(config: &Config, http: &reqwest::Client) -> Result<()> 
 /// 本番と同じ経路 (handle_eew) で Discord へ送信して終了する。
 async fn run_test_eew(config: &Config, http: &reqwest::Client) -> Result<()> {
     info!("テストモード: 過去の緊急地震速報を取得します");
-    let body = http
-        .get(HISTORY_EEW_URL)
-        .send()
-        .await?
-        .error_for_status()?
-        .text()
-        .await?;
-    let items: Vec<serde_json::Value> = serde_json::from_str(&body)?;
+    let items = fetch_history(http, HISTORY_EEW_URL).await?;
     info!(count = items.len(), "履歴を取得しました");
 
     // テスト送信なので重複抑制は効かせない（毎回新しい状態を渡す）。
@@ -393,14 +615,7 @@ async fn run_test_eew(config: &Config, http: &reqwest::Client) -> Result<()> {
 /// テスト用: 過去の津波予報から有効な1件を選び、本番経路 (handle_tsunami) で送信して終了する。
 async fn run_test_tsunami(config: &Config, http: &reqwest::Client) -> Result<()> {
     info!("テストモード: 過去の津波予報を取得します");
-    let body = http
-        .get(HISTORY_TSUNAMI_URL)
-        .send()
-        .await?
-        .error_for_status()?
-        .text()
-        .await?;
-    let items: Vec<serde_json::Value> = serde_json::from_str(&body)?;
+    let items = fetch_history(http, HISTORY_TSUNAMI_URL).await?;
     info!(count = items.len(), "履歴を取得しました");
 
     let mut seen = SeenIds::default();
@@ -450,6 +665,55 @@ async fn handle_text(
     }
 }
 
+/// 通知に添付する地図画像を生成する。生成できない場合は None（テキストのみで通知）。
+///
+/// `hypocenter` が Some なら震源＋観測地点マーカーの地図、None なら観測地点マーカーのみの
+/// 地図にフォールバックする。マーカーも無ければ地図は作らない。
+/// `scale` は震源マーカーの色に使う最大震度スケール。
+///
+/// staticmap のタイル取得は同期通信なので spawn_blocking 上で実行する。加えて、
+/// リクエスト全体のタイムアウトを持たないため `MAP_TIMEOUT` で打ち切る。打ち切っても
+/// 走っているタイル取得自体は止められないが、通知はそれを待たずに先へ進める。
+async fn render_map(
+    config: &Config,
+    hypocenter: Option<(f64, f64)>,
+    scale: i32,
+    markers: Vec<(f64, f64, i32)>,
+) -> Option<Vec<u8>> {
+    if !config.attach_map {
+        return None;
+    }
+    let tile_tpl = config.tile_url_template.clone();
+    let task = match hypocenter {
+        Some((lat, lon)) => tokio::task::spawn_blocking(move || {
+            mapgen::render_quake_map_with_points(lat, lon, scale, &markers, &tile_tpl)
+        }),
+        None if markers.is_empty() => return None,
+        None => tokio::task::spawn_blocking(move || {
+            mapgen::render_markers_map(&markers, &tile_tpl)
+        }),
+    };
+
+    match tokio::time::timeout(MAP_TIMEOUT, task).await {
+        Ok(Ok(Ok(bytes))) => Some(bytes),
+        Ok(Ok(Err(e))) => {
+            warn!(error = %e, "地図画像の生成に失敗。テキストのみで通知します");
+            None
+        }
+        Ok(Err(e)) => {
+            warn!(error = %e, "地図生成タスクが異常終了。テキストのみで通知します");
+            None
+        }
+        Err(_) => {
+            warn!(
+                timeout_secs = MAP_TIMEOUT.as_secs(),
+                "地図生成が時間内に終わらないためテキストのみで通知します"
+            );
+            None
+        }
+    }
+}
+
 /// 地震情報(551) を処理し、通知条件を満たせば通知する。
 ///
 /// 同一地震（発生時刻キー）について速報（震度速報）と詳報（各地の震度など）を別管理し、
@@ -492,45 +756,17 @@ async fn handle_quake(
 
     // 地図画像。震源座標が有効なら震源マップ、未確定（速報など）なら
     // 観測した都道府県ごとのマーカーマップにフォールバックする。
-    // staticmap のタイル取得は同期通信なので spawn_blocking 上で実行する。
-    let image = if config.attach_map {
-        let tile_tpl = config.tile_url_template.clone();
-        let result = if eq.hypocenter.has_valid_coords() {
-            let lat = eq.hypocenter.latitude;
-            let lon = eq.hypocenter.longitude;
-            let scale = eq.max_scale;
-            let markers = geo::points_to_markers(&quake.points);
-            Some(
-                tokio::task::spawn_blocking(move || {
-                    mapgen::render_quake_map_with_points(lat, lon, scale, &markers, &tile_tpl)
-                })
-                .await?,
-            )
-        } else {
-            let markers = geo::points_to_markers(&quake.points);
-            if markers.is_empty() {
-                None
-            } else {
-                Some(
-                    tokio::task::spawn_blocking(move || {
-                        mapgen::render_markers_map(&markers, &tile_tpl)
-                    })
-                    .await?,
-                )
-            }
-        };
-
-        match result {
-            Some(Ok(bytes)) => Some(bytes),
-            Some(Err(e)) => {
-                warn!(error = %e, "地図画像の生成に失敗。テキストのみで通知します");
-                None
-            }
-            None => None,
-        }
-    } else {
-        None
-    };
+    let hypocenter = eq
+        .hypocenter
+        .has_valid_coords()
+        .then_some((eq.hypocenter.latitude, eq.hypocenter.longitude));
+    let image = render_map(
+        config,
+        hypocenter,
+        eq.max_scale,
+        geo::points_to_markers(&quake.points),
+    )
+    .await;
 
     let payload = discord::build_payload(&quake, &decision.reason, image.is_some(), is_test);
     let signature = signature_of(&payload);
@@ -636,39 +872,17 @@ async fn handle_eew(
 
     // 地図画像。震源座標が有効なら震源＋対象地域マーカーの地図、未確定なら
     // 対象地域マーカーのみの地図にフォールバックする（551 と同じ方針）。
-    let image = if config.attach_map {
-        let tile_tpl = config.tile_url_template.clone();
-        let markers = geo::eew_areas_to_markers(&eew.areas);
-        let result = if eew.earthquake.hypocenter.has_valid_coords() {
-            let lat = eew.earthquake.hypocenter.latitude;
-            let lon = eew.earthquake.hypocenter.longitude;
-            let scale = eew_max_scale(&eew.areas);
-            Some(
-                tokio::task::spawn_blocking(move || {
-                    mapgen::render_quake_map_with_points(lat, lon, scale, &markers, &tile_tpl)
-                })
-                .await?,
-            )
-        } else if markers.is_empty() {
-            None
-        } else {
-            Some(
-                tokio::task::spawn_blocking(move || mapgen::render_markers_map(&markers, &tile_tpl))
-                    .await?,
-            )
-        };
-
-        match result {
-            Some(Ok(bytes)) => Some(bytes),
-            Some(Err(e)) => {
-                warn!(error = %e, "地図画像の生成に失敗。テキストのみで通知します");
-                None
-            }
-            None => None,
-        }
-    } else {
-        None
-    };
+    let hypo = &eew.earthquake.hypocenter;
+    let hypocenter = hypo
+        .has_valid_coords()
+        .then_some((hypo.latitude, hypo.longitude));
+    let image = render_map(
+        config,
+        hypocenter,
+        eew_max_scale(&eew.areas),
+        geo::eew_areas_to_markers(&eew.areas),
+    )
+    .await;
 
     let payload = discord::build_eew_payload(&eew, &reason, image.is_some(), is_test);
     let signature = signature_of(&payload);
@@ -767,6 +981,96 @@ mod tests {
 
     fn payload(issue_type: &str, max_scale: i32, reason: &str) -> serde_json::Value {
         discord::build_payload(&quake(issue_type, max_scale), reason, false, false)
+    }
+
+    #[test]
+    fn backoff_stays_short_enough_for_eew() {
+        let mut wait = BACKOFF_MIN;
+        for _ in 0..10 {
+            wait = next_backoff(wait);
+        }
+        assert_eq!(wait, BACKOFF_MAX);
+        // 緊急地震速報は数十秒で終わるため、再接続の待ちが長すぎてはいけない。
+        assert!(BACKOFF_MAX <= Duration::from_secs(10));
+    }
+
+    #[test]
+    fn rate_limited_handshake_is_detected() {
+        use tokio_tungstenite::tungstenite::http::{Response, StatusCode};
+        use tokio_tungstenite::tungstenite::Error;
+
+        // 1 IP から同時に張れる接続は1本だけで、2本目の握手は 429 で拒否される。
+        let too_many = Response::builder()
+            .status(StatusCode::TOO_MANY_REQUESTS)
+            .body(None)
+            .unwrap();
+        assert!(is_rate_limited(&anyhow::Error::new(Error::Http(too_many))));
+
+        let bad_gateway = Response::builder()
+            .status(StatusCode::BAD_GATEWAY)
+            .body(None)
+            .unwrap();
+        assert!(!is_rate_limited(&anyhow::Error::new(Error::Http(bad_gateway))));
+        assert!(!is_rate_limited(&anyhow!("接続が確立しませんでした")));
+    }
+
+    #[test]
+    fn idle_timeout_exceeds_server_ping_interval() {
+        // サーバの ping は実測でおよそ54秒間隔。正常な接続を誤って切らないよう、
+        // しきい値はそれより十分長く取る。
+        assert!(IDLE_TIMEOUT >= Duration::from_secs(70));
+    }
+
+    #[test]
+    fn dispatch_routes_by_code() {
+        let (eew_tx, mut eew_rx) = mpsc::channel(4);
+        let (other_tx, mut other_rx) = mpsc::channel(4);
+        let mut cursor = None;
+
+        dispatch(r#"{"code":556}"#, &eew_tx, &other_tx, &mut cursor);
+        dispatch(r#"{"code":551,"_id":"a1"}"#, &eew_tx, &other_tx, &mut cursor);
+        dispatch(r#"{"code":552}"#, &eew_tx, &other_tx, &mut cursor);
+        // 対象外の code と壊れた JSON は捨てる。
+        dispatch(r#"{"code":555}"#, &eew_tx, &other_tx, &mut cursor);
+        dispatch("not json", &eew_tx, &other_tx, &mut cursor);
+
+        // 緊急地震速報は地震情報と別の待ち行列に入り、地図生成に待たされない。
+        assert_eq!(eew_rx.try_recv().unwrap(), r#"{"code":556}"#);
+        assert!(eew_rx.try_recv().is_err());
+        assert_eq!(other_rx.try_recv().unwrap(), r#"{"code":551,"_id":"a1"}"#);
+        assert_eq!(other_rx.try_recv().unwrap(), r#"{"code":552}"#);
+        assert!(other_rx.try_recv().is_err());
+
+        // 取りこぼしの基準は地震情報(551)だけで進める。
+        assert_eq!(cursor.as_deref(), Some("a1"));
+    }
+
+    #[test]
+    fn missed_since_returns_newer_items_oldest_first() {
+        // 履歴は新しい順。WebSocket は `_id`、履歴 API は `id` で同じ値を返す。
+        let items: Vec<serde_json::Value> = ["n3", "n2", "n1", "seen", "older"]
+            .iter()
+            .map(|id| serde_json::json!({ "id": id, "code": 551 }))
+            .collect();
+
+        let missed: Vec<&str> = missed_since(&items, "seen")
+            .iter()
+            .map(|v| message_id(v).unwrap())
+            .collect();
+        assert_eq!(missed, ["n1", "n2", "n3"]);
+
+        // 最新まで処理済みなら拾い直すものは無い。
+        assert!(missed_since(&items, "n3").is_empty());
+
+        // 基準が履歴に無い（長く切れていた）場合は全件が対象になる。
+        assert_eq!(missed_since(&items, "unknown").len(), items.len());
+    }
+
+    #[test]
+    fn message_id_reads_both_key_names() {
+        assert_eq!(message_id(&serde_json::json!({ "_id": "ws" })), Some("ws"));
+        assert_eq!(message_id(&serde_json::json!({ "id": "rest" })), Some("rest"));
+        assert_eq!(message_id(&serde_json::json!({})), None);
     }
 
     #[test]
