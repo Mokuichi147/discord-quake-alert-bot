@@ -53,14 +53,22 @@ const STABLE_CONNECTION: Duration = Duration::from_secs(60);
 
 /// 接続が 429（レート制限）で拒否されたときの待ち時間。
 ///
-/// このサーバは1つの IP から同時に1接続しか受け付けず、切れたセッションが解放される
-/// までに十数秒かかる（実測）。解放前に叩き直しても弾かれ続けるだけなので、
-/// 通常のバックオフとは別に、解放を待つ時間を空ける。
+/// 公式仕様では `/ws` は IP アドレスごとに2接続までだが、実測では2本目の握手が
+/// すぐ 429 になり、切れたセッションが解放されるまでにも十数秒かかった。解放前に
+/// 叩き直しても弾かれ続けるだけなので、通常のバックオフとは別に待つ時間を空ける。
 const BACKOFF_RATE_LIMITED: Duration = Duration::from_secs(10);
 
-/// 切断中の取りこぼしを履歴 API で確認するときの制限時間。
-/// 確認は再接続の前に行うため、長引かせると復帰そのものが遅れる。
-const CATCH_UP_TIMEOUT: Duration = Duration::from_secs(8);
+/// 切断中の取りこぼしを履歴 API で確認するときの、1種別あたりの制限時間。
+///
+/// 確認の間は受信を始めないため、サーバの ping（接続から約54秒後）に pong を
+/// 返せなくなる前に必ず終わらせる。対象は2種別なので最悪でもこの2倍。
+const CATCH_UP_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// 待ち行列が空くのを待つ上限。
+///
+/// 受信ループを止めるので、pong を返せなくなる猶予（ping から約6秒）より十分
+/// 短くする。ここで捨てると、履歴から拾い直せない緊急地震速報は永久に失われる。
+const QUEUE_WAIT: Duration = Duration::from_secs(2);
 
 /// ワーカーの待ち行列の長さ。通常の受信頻度に対して十分な余裕を取る。
 const WORKER_QUEUE_CAPACITY: usize = 256;
@@ -83,10 +91,18 @@ struct SeenIds {
 }
 
 impl SeenIds {
-    /// 未登録なら記録して true を返す。既に登録済みなら false。
-    fn mark_if_new(&mut self, id: &str) -> bool {
+    /// 記録済みか。
+    fn contains(&self, id: &str) -> bool {
+        self.set.contains(id)
+    }
+
+    /// 記録する。容量超過で古い順に退避する。
+    ///
+    /// 記録するのは通知できた後にする。送信前に記録すると、失敗した発表が
+    /// 再送や履歴からの拾い直しで重複扱いになり、通知が永久に失われる。
+    fn mark(&mut self, id: &str) {
         if !self.set.insert(id.to_string()) {
-            return false;
+            return;
         }
         self.order.push_back(id.to_string());
         if self.order.len() > SEEN_ID_CAPACITY {
@@ -94,7 +110,6 @@ impl SeenIds {
                 self.set.remove(&old);
             }
         }
-        true
     }
 }
 
@@ -311,9 +326,11 @@ fn spawn_worker(
             match handle_text(&config, &http, &msg.text, false, &mut dedup).await {
                 // 通知まで終えたものだけ基準を進める。待ち行列に入れた時点で進めると、
                 // Discord 送信に失敗した報が拾い直しの対象から外れて永久に失われる。
-                Ok(()) => record_handled(&cursors, &msg),
+                Ok(()) => cursors.record_handled(&msg),
                 Err(e) => {
-                    // 基準を進めないので、次の再接続で履歴から拾い直される。
+                    // 失敗を覚えておき、この報を通知できるまで基準を進めない。
+                    // 次の再接続で履歴から拾い直される。
+                    cursors.record_failed(&msg);
                     error!(error = %e, kind, code = msg.code, "メッセージ処理に失敗");
                 }
             }
@@ -340,14 +357,16 @@ async fn run_once(
         .map_err(|_| anyhow!("接続が {} 秒以内に確立しませんでした", CONNECT_TIMEOUT.as_secs()))??;
     info!("WebSocket に接続しました");
 
-    // 取りこぼしの確認は購読を始めてから、受信ループとは別のタスクで行う。
-    // 接続前に取りに行くと履歴と購読の間に隙間ができ、この中で待つと ping に
-    // 応答できず接続を失う。重複して拾った分は重複抑制で落ちる。
-    tokio::spawn(catch_up_all(
-        http.clone(),
-        other_tx.clone(),
-        cursors.clone(),
-    ));
+    // 購読を始めてから、受信を始める前に取りこぼしを拾う。
+    //
+    // 接続前に取りに行くと、履歴のレスポンスから購読開始までに流れた分がどちらにも
+    // 含まれず抜ける。逆に受信と並行して行うと、ライブで受けた新しい報の後ろに
+    // 古い履歴の報が並び、内容を古いものへ差し戻してしまう。
+    //
+    // ここで待っても、接続済みなのでその間の分は取りこぼさない（読み取るまで
+    // バッファに残る）。最初の ping は接続から約54秒後なので、数秒の確認で
+    // pong が遅れることもない。
+    catch_up_all(http, other_tx, cursors).await;
 
     loop {
         // 無通信が続く接続は死んでいるとみなす。ネットワークが黙って切れると
@@ -362,7 +381,7 @@ async fn run_once(
             })?;
         let Some(message) = next else { break };
         match message? {
-            Message::Text(text) => dispatch(&text, eew_tx, other_tx),
+            Message::Text(text) => dispatch(&text, eew_tx, other_tx).await,
             Message::Ping(_) | Message::Pong(_) => {}
             Message::Close(_) => {
                 info!("サーバから切断通知を受信");
@@ -384,25 +403,76 @@ struct Incoming {
     text: String,
 }
 
+/// code ごとの、取りこぼし確認の状態。
+#[derive(Default)]
+struct CursorState {
+    /// 基準を取ったか。取る前は、どこから拾い直せばよいか判断できない。
+    primed: bool,
+    /// 通知まで終えた最新の id。`None` は基準を取ったとき履歴が空だったこと。
+    /// 津波予報の履歴は平時は空で、これを「最新まで処理済み」と同一視すると、
+    /// 切断中に発表された分を起動前の分として捨ててしまう。
+    handled: Option<String>,
+    /// 通知できなかった最も古い報の id。残っている間は `handled` を進めない。
+    /// 進めると、後続の成功がこの報を飛び越して拾い直しの対象から外してしまう。
+    failed: Option<String>,
+}
+
 /// 通知まで終えた最新のメッセージ id を code ごとに保持する。
 ///
 /// ワーカーと取りこぼし確認の両方から触るため共有する。
-///
-/// キーが無ければ、まだ基準を取っていない（起動直後）。値が `None` は、基準を
-/// 取ったときに履歴が空だったことを表す。津波予報の履歴は平時は空で、これを
-/// 「最新まで処理済み」と同一視すると、切断中に発表された分を起動前の分として
-/// 捨ててしまう。
 #[derive(Clone, Default)]
-struct Cursors(Arc<Mutex<HashMap<i32, Option<String>>>>);
+struct Cursors(Arc<Mutex<HashMap<i32, CursorState>>>);
 
 impl Cursors {
-    /// 外側の `None` は未設定、内側の `None` は基準を取ったとき履歴が空だったこと。
-    fn get(&self, code: i32) -> Option<Option<String>> {
-        self.0.lock().expect("毒された Mutex").get(&code).cloned()
+    /// 拾い直しの起点。外側の `None` は未設定（起動直後）。
+    fn baseline(&self, code: i32) -> Option<Option<String>> {
+        let map = self.lock();
+        let state = map.get(&code)?;
+        state.primed.then(|| state.handled.clone())
     }
 
-    fn set(&self, code: i32, id: Option<String>) {
-        self.0.lock().expect("毒された Mutex").insert(code, id);
+    /// 起点を置き直す。積み残していた失敗も忘れる。
+    fn rebase(&self, code: i32, id: Option<String>) {
+        let mut map = self.lock();
+        let state = map.entry(code).or_default();
+        state.primed = true;
+        state.handled = id;
+        state.failed = None;
+    }
+
+    /// 通知まで終えた報を記録する。
+    ///
+    /// 先に失敗した報が残っている間は起点を進めない。進めるのは、その報自身を
+    /// 通知できたとき（穴が埋まったとき）だけ。
+    fn record_handled(&self, message: &Incoming) {
+        let Some(id) = &message.id else { return };
+        if !is_catch_up_target(message.code) {
+            return;
+        }
+        let mut map = self.lock();
+        let state = map.entry(message.code).or_default();
+        if state.failed.as_deref().is_some_and(|failed| failed != id) {
+            return;
+        }
+        state.failed = None;
+        state.handled = Some(id.clone());
+    }
+
+    /// 通知できなかった報を記録する。以後、この報を通知できるまで起点は進まない。
+    fn record_failed(&self, message: &Incoming) {
+        let Some(id) = &message.id else { return };
+        if !is_catch_up_target(message.code) {
+            return;
+        }
+        let mut map = self.lock();
+        let state = map.entry(message.code).or_default();
+        if state.failed.is_none() {
+            state.failed = Some(id.clone());
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<i32, CursorState>> {
+        self.0.lock().expect("毒された Mutex")
     }
 }
 
@@ -420,25 +490,16 @@ fn is_catch_up_target(code: i32) -> bool {
     CATCH_UP_TARGETS.iter().any(|(target, _)| *target == code)
 }
 
-/// 通知まで終えたメッセージを、取りこぼし確認の基準として記録する。
-///
-/// 処理に失敗したものは記録しない。記録してしまうと履歴からの拾い直しの対象から
-/// 外れ、その通知が永久に失われる。
-fn record_handled(cursors: &Cursors, message: &Incoming) {
-    if !is_catch_up_target(message.code) {
-        return;
-    }
-    if let Some(id) = &message.id {
-        cursors.set(message.code, Some(id.clone()));
-    }
-}
-
 /// 受信テキストを code で振り分けてワーカーへ渡す。
 ///
-/// 待ち行列が詰まっている場合は捨てて記録する。受信ループを止めると pong が遅れ、
-/// 接続ごと失って以降の続報も落とすため、待たずに次の受信へ進むことを優先する。
-/// 捨てた分は再接続時に履歴から拾い直される（緊急地震速報を除く）。
-fn dispatch(text: &str, eew_tx: &mpsc::Sender<Incoming>, other_tx: &mpsc::Sender<Incoming>) {
+/// 待ち行列が詰まっている場合は少しだけ空くのを待つ。緊急地震速報は履歴から
+/// 拾い直せないため、捨てると永久に失われるため。ただし受信ループを止めると
+/// pong が遅れて接続ごと失うので、待つのは `QUEUE_WAIT` までにする。
+async fn dispatch(
+    text: &str,
+    eew_tx: &mpsc::Sender<Incoming>,
+    other_tx: &mpsc::Sender<Incoming>,
+) {
     // 想定外のフォーマットは無視する。
     let Ok(value) = serde_json::from_str::<serde_json::Value>(text) else {
         return;
@@ -457,14 +518,18 @@ fn dispatch(text: &str, eew_tx: &mpsc::Sender<Incoming>, other_tx: &mpsc::Sender
         id: message_id(&value).map(str::to_string),
         text: text.to_string(),
     };
-    match tx.try_send(message) {
+    match tx.send_timeout(message, QUEUE_WAIT).await {
         Ok(()) => {}
-        Err(mpsc::error::TrySendError::Full(_)) => {
-            error!(code, "処理が追いつかずメッセージを破棄しました");
+        Err(mpsc::error::SendTimeoutError::Timeout(_)) => {
+            error!(
+                code,
+                wait_secs = QUEUE_WAIT.as_secs(),
+                "待ち行列が空かずメッセージを破棄しました"
+            );
         }
         // ワーカーが落ちている。このまま動き続けても二度と通知できないので、
         // 黙って生き残らずに終了し、プロセス管理（systemd 等）に再起動させる。
-        Err(mpsc::error::TrySendError::Closed(_)) => {
+        Err(mpsc::error::SendTimeoutError::Closed(_)) => {
             error!(code, "通知ワーカーが停止しています。プロセスを終了します");
             std::process::exit(1);
         }
@@ -527,9 +592,9 @@ fn plan_catch_up<'a>(
 }
 
 /// 切断中に流れた分を、拾い直す対象すべてについて履歴から回収する。
-async fn catch_up_all(http: reqwest::Client, tx: mpsc::Sender<Incoming>, cursors: Cursors) {
+async fn catch_up_all(http: &reqwest::Client, tx: &mpsc::Sender<Incoming>, cursors: &Cursors) {
     for (code, url) in CATCH_UP_TARGETS {
-        catch_up(&http, &tx, &cursors, code, url).await;
+        catch_up(http, tx, cursors, code, url).await;
     }
 }
 
@@ -558,12 +623,12 @@ async fn catch_up(
 
     // 履歴は新しい順に並んでいる。
     let newest = items.first().and_then(message_id).map(str::to_string);
-    let previous = cursors.get(code);
+    let previous = cursors.baseline(code);
     let first_time = previous.is_none();
 
     let missed = match plan_catch_up(&items, previous) {
         CatchUp::Rebase => {
-            cursors.set(code, newest);
+            cursors.rebase(code, newest);
             if first_time {
                 info!(code, "起動時の基準を記録しました（起動前の分は通知しません）");
             } else {
@@ -1046,8 +1111,10 @@ async fn handle_tsunami(
 ) -> Result<()> {
     let tsunami: Tsunami = serde_json::from_str(text)?;
 
-    // 同一発表の再送を除去する（id で重複判定）。
-    if !tsunami.id.is_empty() && !seen.mark_if_new(&tsunami.id) {
+    // 同一発表の再送を除去する（id で重複判定）。記録は通知できた後に行う。
+    // 送信前に記録すると、失敗した発表が拾い直しでも重複扱いになり永久に失われる。
+    let id = tsunami.id.clone();
+    if !id.is_empty() && seen.contains(&id) {
         return Ok(());
     }
 
@@ -1055,6 +1122,7 @@ async fn handle_tsunami(
         info!("津波予報の解除を受信");
         let payload = discord::build_tsunami_payload(&tsunami, is_test);
         discord::send(http, &config.webhook_url, &payload, None).await?;
+        seen.mark(&id);
         info!("津波予報の解除を通知しました");
         return Ok(());
     }
@@ -1067,12 +1135,15 @@ async fn handle_tsunami(
         .max()
         .unwrap_or(0);
     if max_rank == 0 {
+        // 通知対象外と判断できたので、処理済みとして記録する。
+        seen.mark(&id);
         return Ok(());
     }
 
     info!(areas = tsunami.areas.len(), "津波予報を検出");
     let payload = discord::build_tsunami_payload(&tsunami, is_test);
     discord::send(http, &config.webhook_url, &payload, None).await?;
+    seen.mark(&id);
     info!("津波予報を通知しました");
     Ok(())
 }
@@ -1156,7 +1227,7 @@ mod tests {
 
     /// 現在の基準で拾い直しの対象を求める（地震情報のみ）。
     fn plan<'a>(items: &'a [serde_json::Value], cursors: &Cursors) -> Vec<&'a serde_json::Value> {
-        match plan_catch_up(items, cursors.get(CODE_JMA_QUAKE)) {
+        match plan_catch_up(items, cursors.baseline(CODE_JMA_QUAKE)) {
             CatchUp::Missed(missed) => missed,
             CatchUp::Rebase => panic!("基準があるので拾い直しの対象になるはず"),
         }
@@ -1170,17 +1241,17 @@ mod tests {
         }
     }
 
-    #[test]
-    fn dispatch_routes_by_code() {
+    #[tokio::test]
+    async fn dispatch_routes_by_code() {
         let (eew_tx, mut eew_rx) = mpsc::channel(4);
         let (other_tx, mut other_rx) = mpsc::channel(4);
 
-        dispatch(r#"{"code":556,"_id":"e1"}"#, &eew_tx, &other_tx);
-        dispatch(r#"{"code":551,"_id":"q1"}"#, &eew_tx, &other_tx);
-        dispatch(r#"{"code":552,"_id":"t1"}"#, &eew_tx, &other_tx);
+        dispatch(r#"{"code":556,"_id":"e1"}"#, &eew_tx, &other_tx).await;
+        dispatch(r#"{"code":551,"_id":"q1"}"#, &eew_tx, &other_tx).await;
+        dispatch(r#"{"code":552,"_id":"t1"}"#, &eew_tx, &other_tx).await;
         // 対象外の code と壊れた JSON は捨てる。
-        dispatch(r#"{"code":555}"#, &eew_tx, &other_tx);
-        dispatch("not json", &eew_tx, &other_tx);
+        dispatch(r#"{"code":555}"#, &eew_tx, &other_tx).await;
+        dispatch("not json", &eew_tx, &other_tx).await;
 
         // 緊急地震速報は地震情報と別の待ち行列に入り、地図生成に待たされない。
         let eew = eew_rx.try_recv().unwrap();
@@ -1213,16 +1284,19 @@ mod tests {
     #[test]
     fn cursor_advances_only_for_notified_messages() {
         let cursors = Cursors::default();
+        for code in [CODE_JMA_QUAKE, CODE_TSUNAMI] {
+            cursors.rebase(code, None);
+        }
 
         // 通知まで終えた分だけ記録する（ワーカーは失敗時に呼ばない）。
-        record_handled(&cursors, &incoming(CODE_JMA_QUAKE, "q1"));
-        record_handled(&cursors, &incoming(CODE_TSUNAMI, "t1"));
+        cursors.record_handled(&incoming(CODE_JMA_QUAKE, "q1"));
+        cursors.record_handled(&incoming(CODE_TSUNAMI, "t1"));
         // 緊急地震速報は拾い直しの対象外なので基準を持たない。
-        record_handled(&cursors, &incoming(CODE_EEW, "e1"));
+        cursors.record_handled(&incoming(CODE_EEW, "e1"));
 
-        assert_eq!(cursors.get(CODE_JMA_QUAKE), Some(Some("q1".to_string())));
-        assert_eq!(cursors.get(CODE_TSUNAMI), Some(Some("t1".to_string())));
-        assert_eq!(cursors.get(CODE_EEW), None);
+        assert_eq!(cursors.baseline(CODE_JMA_QUAKE), Some(Some("q1".to_string())));
+        assert_eq!(cursors.baseline(CODE_TSUNAMI), Some(Some("t1".to_string())));
+        assert_eq!(cursors.baseline(CODE_EEW), None);
     }
 
     #[test]
@@ -1231,17 +1305,85 @@ mod tests {
         // 待ち行列に入れた時点で基準を進めると、この経路で通知が永久に失われる。
         let items = history(&["q3", "q2", "q1", "base"]);
         let cursors = Cursors::default();
-        cursors.set(CODE_JMA_QUAKE, Some("base".to_string()));
+        cursors.rebase(CODE_JMA_QUAKE, Some("base".to_string()));
 
         let missed = plan(&items, &cursors);
         assert_eq!(ids_of(&missed), ["q1", "q2", "q3"]);
 
         // q1 の通知だけ成功した状態。残りは次回も対象に残る。
-        record_handled(&cursors, &incoming(CODE_JMA_QUAKE, "q1"));
+        cursors.record_handled(&incoming(CODE_JMA_QUAKE, "q1"));
         assert_eq!(ids_of(&plan(&items, &cursors)), ["q2", "q3"]);
 
         // 最新まで通知できたら拾い直すものは無くなる。
-        record_handled(&cursors, &incoming(CODE_JMA_QUAKE, "q3"));
+        cursors.record_handled(&incoming(CODE_JMA_QUAKE, "q2"));
+        cursors.record_handled(&incoming(CODE_JMA_QUAKE, "q3"));
+        assert!(plan(&items, &cursors).is_empty());
+    }
+
+    #[tokio::test]
+    async fn dispatch_waits_for_room_instead_of_dropping() {
+        // 緊急地震速報は履歴から拾い直せないので、待ち行列が満杯でもすぐには捨てない。
+        let (eew_tx, mut eew_rx) = mpsc::channel(1);
+        let (other_tx, _other_rx) = mpsc::channel(1);
+
+        dispatch(r#"{"code":556,"_id":"e1"}"#, &eew_tx, &other_tx).await;
+
+        // 受け手が空けるまで待ってから入ること。
+        let consumer = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let first = eew_rx.recv().await.unwrap();
+            let second = eew_rx.recv().await.unwrap();
+            (first.id, second.id)
+        });
+        dispatch(r#"{"code":556,"_id":"e2"}"#, &eew_tx, &other_tx).await;
+
+        let (first, second) = consumer.await.unwrap();
+        assert_eq!((first.as_deref(), second.as_deref()), (Some("e1"), Some("e2")));
+    }
+
+    #[tokio::test]
+    async fn tsunami_is_not_marked_seen_when_sending_fails() {
+        // 送信前に記録すると、失敗した発表が再送や履歴からの拾い直しでも重複扱いに
+        // なり、通知が永久に失われる。
+        let config = Config {
+            webhook_url: "http://127.0.0.1:1/failing-webhook".to_string(),
+            ws_url: String::new(),
+            region_min_scales: HashMap::new(),
+            other_min_scale: 10,
+            attach_map: false,
+            tile_url_template: String::new(),
+        };
+        let http = reqwest::Client::new();
+        let text = r#"{"code":552,"_id":"t1","areas":[{"grade":"Watch","name":"三陸沿岸"}]}"#;
+        let mut seen = SeenIds::default();
+
+        let result = handle_tsunami(&config, &http, text, false, &mut seen).await;
+        assert!(result.is_err(), "送信できなければエラーになるはず");
+        assert!(!seen.contains("t1"), "送信に失敗した発表は記録しない");
+    }
+
+    #[test]
+    fn later_success_does_not_skip_over_a_failed_report() {
+        // q1 成功 → q2 失敗 → q3 成功。q3 まで基準を進めると q2 が拾い直しの
+        // 対象から外れ、通知が永久に失われる。
+        let items = history(&["q3", "q2", "q1", "base"]);
+        let cursors = Cursors::default();
+        cursors.rebase(CODE_JMA_QUAKE, Some("base".to_string()));
+
+        cursors.record_handled(&incoming(CODE_JMA_QUAKE, "q1"));
+        cursors.record_failed(&incoming(CODE_JMA_QUAKE, "q2"));
+        cursors.record_handled(&incoming(CODE_JMA_QUAKE, "q3"));
+        assert_eq!(ids_of(&plan(&items, &cursors)), ["q2", "q3"]);
+
+        // 拾い直しで q2 も失敗し続ける間は、対象から外れない。
+        cursors.record_failed(&incoming(CODE_JMA_QUAKE, "q2"));
+        cursors.record_handled(&incoming(CODE_JMA_QUAKE, "q3"));
+        assert_eq!(ids_of(&plan(&items, &cursors)), ["q2", "q3"]);
+
+        // q2 を通知できたら穴が埋まり、その先へ進める。
+        cursors.record_handled(&incoming(CODE_JMA_QUAKE, "q2"));
+        assert_eq!(ids_of(&plan(&items, &cursors)), ["q3"]);
+        cursors.record_handled(&incoming(CODE_JMA_QUAKE, "q3"));
         assert!(plan(&items, &cursors).is_empty());
     }
 
@@ -1257,12 +1399,15 @@ mod tests {
         // 津波予報の履歴は平時は空。空を「最新まで処理済み」と同一視すると、
         // 切断中に発表された分を起動前の分として捨ててしまう。
         let cursors = Cursors::default();
-        assert!(matches!(plan_catch_up(&[], cursors.get(CODE_TSUNAMI)), CatchUp::Rebase));
-        cursors.set(CODE_TSUNAMI, None);
+        assert!(matches!(
+            plan_catch_up(&[], cursors.baseline(CODE_TSUNAMI)),
+            CatchUp::Rebase
+        ));
+        cursors.rebase(CODE_TSUNAMI, None);
 
         // その後に発表された分はすべて取りこぼし扱いになる。
         let items = history(&["t2", "t1"]);
-        let CatchUp::Missed(missed) = plan_catch_up(&items, cursors.get(CODE_TSUNAMI)) else {
+        let CatchUp::Missed(missed) = plan_catch_up(&items, cursors.baseline(CODE_TSUNAMI)) else {
             panic!("拾い直しの対象になるはず");
         };
         assert_eq!(ids_of(&missed), ["t1", "t2"]);
