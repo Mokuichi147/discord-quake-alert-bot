@@ -72,19 +72,9 @@ const FAILED_RETRY_INTERVAL: Duration = Duration::from_secs(60);
 
 /// 待ち行列を空にするのを待つ上限。
 ///
-/// 待つ間は受信を止めるため、長くしすぎると pong を返せなくなる。ワーカーが
-/// これでも空かないほど詰まっている場合は、順序が乱れる可能性を受け入れて先へ進む
-/// （順序の乱れは通知内容が一時的に古く戻るだけで、拾い直しでいずれ最新に戻る）。
+/// 待つ間は受信を止めるため、長くしすぎると pong を返せなくなる。これでも
+/// 空かないほどワーカーが詰まっている場合は、その回の拾い直しを見送る。
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// 待ち行列が空くのを待つ上限。
-///
-/// 受信ループを止めるので、pong を返せなくなる猶予（ping から約6秒）より十分
-/// 短くする。ここで捨てると、履歴から拾い直せない緊急地震速報は永久に失われる。
-const QUEUE_WAIT: Duration = Duration::from_secs(2);
-
-/// ワーカーの待ち行列の長さ。通常の受信頻度に対して十分な余裕を取る。
-const WORKER_QUEUE_CAPACITY: usize = 256;
 
 /// 地図生成（タイル取得を含む）を諦めるまでの時間。
 ///
@@ -330,8 +320,12 @@ fn spawn_worker(
     http: reqwest::Client,
     kind: &'static str,
     cursors: Cursors,
-) -> mpsc::Sender<Job> {
-    let (tx, mut rx) = mpsc::channel::<Job>(WORKER_QUEUE_CAPACITY);
+) -> mpsc::UnboundedSender<Job> {
+    // 待ち行列に上限を置かない。上限を置くと、溢れたときに捨てるか受信ループを
+    // 止めるかしかなく、緊急地震速報は履歴から拾い直せないため捨てれば永久に失う。
+    // ワーカーは地図生成にも Discord 送信にも制限時間があるので、溜まっても必ず
+    // はけていく（際限なく積み上がることはない）。
+    let (tx, mut rx) = mpsc::unbounded_channel::<Job>();
     tokio::spawn(async move {
         // 重複報・再送を抑制する状態。再接続をまたいで保持する。
         let mut dedup = DedupState::default();
@@ -360,48 +354,37 @@ fn spawn_worker(
     tx
 }
 
-/// ワーカーへ1件渡す。渡せなければ失敗として記録し、false を返す。
+/// ワーカーへ1件渡す。
 ///
-/// 記録しないと、後続の報の通知が成功したときに基準がこの報を飛び越し、
-/// 拾い直しの対象から外れてしまう。
-async fn enqueue(tx: &mpsc::Sender<Job>, cursors: &Cursors, message: Incoming) -> bool {
+/// 待ち行列に上限が無いので、詰まっていても捨てず、受信ループも止めない。
+fn enqueue(tx: &mpsc::UnboundedSender<Job>, message: Incoming) {
     let code = message.code;
-    match tx.send_timeout(Job::Message(message), QUEUE_WAIT).await {
-        Ok(()) => true,
-        Err(mpsc::error::SendTimeoutError::Timeout(job)) => {
-            if let Job::Message(message) = &job {
-                cursors.record_failed(message);
-            }
-            error!(
-                code,
-                wait_secs = QUEUE_WAIT.as_secs(),
-                "待ち行列が空かずメッセージを渡せませんでした"
-            );
-            false
-        }
+    if tx.send(Job::Message(message)).is_err() {
         // ワーカーが落ちている。このまま動き続けても二度と通知できないので、
         // 黙って生き残らずに終了し、プロセス管理（systemd 等）に再起動させる。
-        Err(mpsc::error::SendTimeoutError::Closed(_)) => {
-            error!(code, "通知ワーカーが停止しています。プロセスを終了します");
-            std::process::exit(1);
-        }
+        error!(code, "通知ワーカーが停止しています。プロセスを終了します");
+        std::process::exit(1);
     }
 }
 
-/// 待ち行列に残っている分を処理し終えるまで待つ。
+/// 待ち行列に残っている分を処理し終えるまで待つ。空にできたら true。
 ///
 /// 履歴からの拾い直しの前に呼び、古い履歴の報が新しいライブの報より後ろに
-/// 並ばないようにする。
-async fn drain(tx: &mpsc::Sender<Job>) {
+/// 並ばないようにする。待ち行列に上限が無いので、目印を置く操作自体は待たされない。
+async fn drain(tx: &mpsc::UnboundedSender<Job>) -> bool {
     let (done, wait) = tokio::sync::oneshot::channel();
-    if tx.send(Job::Barrier(done)).await.is_err() {
-        return;
+    if tx.send(Job::Barrier(done)).is_err() {
+        return false;
     }
-    if tokio::time::timeout(DRAIN_TIMEOUT, wait).await.is_err() {
-        warn!(
-            timeout_secs = DRAIN_TIMEOUT.as_secs(),
-            "待ち行列が空くのを待てませんでした"
-        );
+    match tokio::time::timeout(DRAIN_TIMEOUT, wait).await {
+        Ok(Ok(())) => true,
+        _ => {
+            warn!(
+                timeout_secs = DRAIN_TIMEOUT.as_secs(),
+                "待ち行列が空くのを待てませんでした"
+            );
+            false
+        }
     }
 }
 
@@ -413,8 +396,8 @@ async fn drain(tx: &mpsc::Sender<Job>) {
 async fn run_once(
     config: &Config,
     http: &reqwest::Client,
-    eew_tx: &mpsc::Sender<Job>,
-    other_tx: &mpsc::Sender<Job>,
+    eew_tx: &mpsc::UnboundedSender<Job>,
+    other_tx: &mpsc::UnboundedSender<Job>,
     cursors: &Cursors,
 ) -> Result<()> {
     let connect = tokio_tungstenite::connect_async(config.ws_url.as_str());
@@ -454,10 +437,10 @@ async fn run_once(
                 );
             }
             _ = retry.tick() => {
-                // 失敗が残っているときだけ取りに行く。受信を止めるのは、
-                // ライブの報と履歴の報が混ざらないようにするため。
-                if cursors.has_failures() {
-                    info!("通知できていない報があるため拾い直します");
+                // 必要なときだけ取りに行く。受信を止めるのは、ライブの報と
+                // 履歴の報が混ざらないようにするため。
+                if cursors.needs_catch_up() {
+                    info!("通知できていない報または未取得の基準があるため履歴を確認します");
                     catch_up_all(http, other_tx, cursors).await;
                 }
                 continue;
@@ -469,7 +452,7 @@ async fn run_once(
             }
         };
         match message {
-            Message::Text(text) => dispatch(&text, eew_tx, other_tx, cursors).await,
+            Message::Text(text) => dispatch(&text, eew_tx, other_tx),
             Message::Ping(_) | Message::Pong(_) => {}
             Message::Close(_) => {
                 info!("サーバから切断通知を受信");
@@ -576,6 +559,18 @@ impl Cursors {
         self.lock().values().any(|state| state.failed.is_some())
     }
 
+    /// 履歴を見に行く必要があるか。
+    ///
+    /// 通知できていない報が残っているか、まだ基準を取れていない種別がある場合。
+    /// 基準が無いのは初回の履歴取得に失敗したときで、放置すると次の再接続まで
+    /// 基準が空のままになり、その間の取りこぼしを拾えない。
+    fn needs_catch_up(&self) -> bool {
+        self.has_failures()
+            || CATCH_UP_TARGETS
+                .iter()
+                .any(|(code, _)| self.baseline(*code).is_none())
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<i32, CursorState>> {
         self.0.lock().expect("毒された Mutex")
     }
@@ -597,14 +592,12 @@ fn is_catch_up_target(code: i32) -> bool {
 
 /// 受信テキストを code で振り分けてワーカーへ渡す。
 ///
-/// 待ち行列が詰まっている場合は少しだけ空くのを待つ。緊急地震速報は履歴から
-/// 拾い直せないため、捨てると永久に失われるため。ただし受信ループを止めると
-/// pong が遅れて接続ごと失うので、待つのは `QUEUE_WAIT` までにする。
-async fn dispatch(
+/// 待ち行列に上限が無いので、ワーカーが詰まっていても捨てず、受信も止めない。
+/// 緊急地震速報は履歴から拾い直せないため、捨てると永久に失われる。
+fn dispatch(
     text: &str,
-    eew_tx: &mpsc::Sender<Job>,
-    other_tx: &mpsc::Sender<Job>,
-    cursors: &Cursors,
+    eew_tx: &mpsc::UnboundedSender<Job>,
+    other_tx: &mpsc::UnboundedSender<Job>,
 ) {
     // 想定外のフォーマットは無視する。
     let Ok(value) = serde_json::from_str::<serde_json::Value>(text) else {
@@ -624,7 +617,7 @@ async fn dispatch(
         id: message_id(&value).map(str::to_string),
         text: text.to_string(),
     };
-    enqueue(tx, cursors, message).await;
+    enqueue(tx, message);
 }
 
 /// メッセージの id。WebSocket は `_id`、履歴 API は `id` と名前が違うが値は同じ。
@@ -683,10 +676,13 @@ fn plan_catch_up<'a>(
 }
 
 /// 切断中に流れた分を、拾い直す対象すべてについて履歴から回収する。
-async fn catch_up_all(http: &reqwest::Client, tx: &mpsc::Sender<Job>, cursors: &Cursors) {
+async fn catch_up_all(http: &reqwest::Client, tx: &mpsc::UnboundedSender<Job>, cursors: &Cursors) {
     // 待ち行列に残っているライブの報を先に処理させる。残したまま古い履歴の報を
-    // 積むと、新しい内容が古い内容へ差し戻されてしまう。
-    drain(tx).await;
+    // 積むと、新しい内容が古い内容へ差し戻されてしまう。空にできなければ、
+    // 順序を崩さないようこの回は見送る（基準は進まないので次の機会に拾い直す）。
+    if !drain(tx).await {
+        return;
+    }
     for (code, url) in CATCH_UP_TARGETS {
         catch_up(http, tx, cursors, code, url).await;
     }
@@ -698,7 +694,7 @@ async fn catch_up_all(http: &reqwest::Client, tx: &mpsc::Sender<Job>, cursors: &
 /// そうしないと、起動のたびに過去の地震や津波予報をまとめて投稿してしまう。
 async fn catch_up(
     http: &reqwest::Client,
-    tx: &mpsc::Sender<Job>,
+    tx: &mpsc::UnboundedSender<Job>,
     cursors: &Cursors,
     code: i32,
     url: &str,
@@ -743,10 +739,7 @@ async fn catch_up(
             id: message_id(item).map(str::to_string),
             text: item.to_string(),
         };
-        // 渡せなかった分は失敗として記録され、基準がそこを飛び越さない。
-        if !enqueue(tx, cursors, message).await {
-            return;
-        }
+        enqueue(tx, message);
     }
 }
 
@@ -1335,25 +1328,24 @@ mod tests {
     }
 
     /// 待ち行列から次のメッセージを取り出す（区切りは想定しない）。
-    fn next_message(rx: &mut mpsc::Receiver<Job>) -> Option<Incoming> {
+    fn next_message(rx: &mut mpsc::UnboundedReceiver<Job>) -> Option<Incoming> {
         match rx.try_recv().ok()? {
             Job::Message(message) => Some(message),
             Job::Barrier(_) => panic!("ここでは区切りを流していない"),
         }
     }
 
-    #[tokio::test]
-    async fn dispatch_routes_by_code() {
-        let (eew_tx, mut eew_rx) = mpsc::channel(4);
-        let (other_tx, mut other_rx) = mpsc::channel(4);
-        let cursors = Cursors::default();
+    #[test]
+    fn dispatch_routes_by_code() {
+        let (eew_tx, mut eew_rx) = mpsc::unbounded_channel();
+        let (other_tx, mut other_rx) = mpsc::unbounded_channel();
 
-        dispatch(r#"{"code":556,"_id":"e1"}"#, &eew_tx, &other_tx, &cursors).await;
-        dispatch(r#"{"code":551,"_id":"q1"}"#, &eew_tx, &other_tx, &cursors).await;
-        dispatch(r#"{"code":552,"_id":"t1"}"#, &eew_tx, &other_tx, &cursors).await;
+        dispatch(r#"{"code":556,"_id":"e1"}"#, &eew_tx, &other_tx);
+        dispatch(r#"{"code":551,"_id":"q1"}"#, &eew_tx, &other_tx);
+        dispatch(r#"{"code":552,"_id":"t1"}"#, &eew_tx, &other_tx);
         // 対象外の code と壊れた JSON は捨てる。
-        dispatch(r#"{"code":555}"#, &eew_tx, &other_tx, &cursors).await;
-        dispatch("not json", &eew_tx, &other_tx, &cursors).await;
+        dispatch(r#"{"code":555}"#, &eew_tx, &other_tx);
+        dispatch("not json", &eew_tx, &other_tx);
 
         // 緊急地震速報は地震情報と別の待ち行列に入り、地図生成に待たされない。
         let eew = next_message(&mut eew_rx).unwrap();
@@ -1422,57 +1414,30 @@ mod tests {
         assert!(plan(&items, &cursors).is_empty());
     }
 
-    #[tokio::test]
-    async fn dispatch_waits_for_room_instead_of_dropping() {
-        // 緊急地震速報は履歴から拾い直せないので、待ち行列が満杯でもすぐには捨てない。
-        let (eew_tx, mut eew_rx) = mpsc::channel(1);
-        let (other_tx, _other_rx) = mpsc::channel(1);
-        let cursors = Cursors::default();
+    #[test]
+    fn dispatch_never_drops_when_the_worker_is_busy() {
+        // ワーカーが止まっていても捨てない。緊急地震速報は履歴から拾い直せないため、
+        // 捨てると永久に失われる。
+        let (eew_tx, mut eew_rx) = mpsc::unbounded_channel();
+        let (other_tx, _other_rx) = mpsc::unbounded_channel();
 
-        dispatch(r#"{"code":556,"_id":"e1"}"#, &eew_tx, &other_tx, &cursors).await;
+        // 誰も取り出さないまま、続けて渡す。
+        for serial in 0..1000 {
+            dispatch(&format!(r#"{{"code":556,"_id":"e{serial}"}}"#), &eew_tx, &other_tx);
+        }
 
-        // 受け手が空けるまで待ってから入ること。
-        let consumer = tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            let ids = [eew_rx.recv().await, eew_rx.recv().await];
-            ids.map(|job| match job {
-                Some(Job::Message(message)) => message.id,
-                _ => None,
-            })
-        });
-        dispatch(r#"{"code":556,"_id":"e2"}"#, &eew_tx, &other_tx, &cursors).await;
-
-        let [first, second] = consumer.await.unwrap();
-        assert_eq!((first.as_deref(), second.as_deref()), (Some("e1"), Some("e2")));
-    }
-
-    #[tokio::test]
-    async fn dropped_message_is_not_skipped_by_a_later_success() {
-        // 待ち行列に渡せなかった報も失敗として記録する。記録しないと、後続の報の
-        // 通知が成功したときに基準がこれを飛び越し、拾い直しの対象から外れる。
-        let items = history(&["q2", "q1", "base"]);
-        let cursors = Cursors::default();
-        cursors.rebase(CODE_JMA_QUAKE, Some("base".to_string()));
-
-        // 受け手がいないまま満杯にして、次の1件を渡せなくする。
-        let (eew_tx, _eew_rx) = mpsc::channel(1);
-        let (other_tx, _other_rx) = mpsc::channel(1);
-        dispatch(r#"{"code":551,"_id":"q1"}"#, &eew_tx, &other_tx, &cursors).await;
-        dispatch(r#"{"code":551,"_id":"q2"}"#, &eew_tx, &other_tx, &cursors).await;
-
-        // q2 は渡せていないので、q1 の通知が成功しても基準は q2 を飛び越さない。
-        // 穴が埋まるまで基準は据え置かれ、拾い直しの対象に q2 が残る
-        // （先に通知できた q1 も一緒に拾われるが、重複抑制で落ちる）。
-        cursors.record_handled(&incoming(CODE_JMA_QUAKE, "q1"));
-        let missed = ids_of(&plan(&items, &cursors));
-        assert!(missed.contains(&"q2".to_string()), "渡せなかった報が対象に残ること");
-        assert_eq!(missed, ["q1", "q2"]);
+        // 渡した順に、1件も欠けずに残っている。
+        for serial in 0..1000 {
+            let message = next_message(&mut eew_rx).unwrap();
+            assert_eq!(message.id.as_deref(), Some(format!("e{serial}").as_str()));
+        }
+        assert!(next_message(&mut eew_rx).is_none());
     }
 
     #[tokio::test]
     async fn barrier_reports_when_the_queue_is_drained() {
         // 拾い直しの前に、待ち行列に残っているライブの報を処理させるための目印。
-        let (tx, mut rx) = mpsc::channel::<Job>(4);
+        let (tx, mut rx) = mpsc::unbounded_channel::<Job>();
         let worker = tokio::spawn(async move {
             let mut seen = Vec::new();
             while let Some(job) = rx.recv().await {
@@ -1487,16 +1452,10 @@ mod tests {
             seen
         });
 
-        let cursors = Cursors::default();
         for id in ["q1", "q2"] {
-            let message = Incoming {
-                code: CODE_JMA_QUAKE,
-                id: Some(id.to_string()),
-                text: String::new(),
-            };
-            assert!(enqueue(&tx, &cursors, message).await);
+            enqueue(&tx, incoming(CODE_JMA_QUAKE, id));
         }
-        drain(&tx).await;
+        assert!(drain(&tx).await, "空にできたと報告すること");
 
         // 区切りに達した時点で、先に入れた分は処理し終えている。
         assert_eq!(worker.await.unwrap(), ["q1", "q2"]);
@@ -1566,6 +1525,24 @@ mod tests {
 
         cursors.record_handled(&incoming(CODE_TSUNAMI, "t1"));
         assert!(!cursors.has_failures());
+    }
+
+    #[test]
+    fn missing_baseline_keeps_asking_for_a_catch_up() {
+        // 初回の履歴取得に失敗すると基準が空のままになる。放置すると次の再接続まで
+        // 拾い直しに行かず、その間の取りこぼしを拾えない。
+        let cursors = Cursors::default();
+        assert!(cursors.needs_catch_up(), "基準が無いなら取りに行く");
+
+        // ライブの報を処理しただけでは基準は確立しない。
+        cursors.record_handled(&incoming(CODE_JMA_QUAKE, "q1"));
+        assert!(cursors.needs_catch_up());
+
+        // 履歴を取れて初めて基準が定まり、以後は失敗が無い限り取りに行かない。
+        for (code, _) in CATCH_UP_TARGETS {
+            cursors.rebase(code, None);
+        }
+        assert!(!cursors.needs_catch_up());
     }
 
     #[test]
