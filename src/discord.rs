@@ -383,16 +383,32 @@ fn retry_after(response: &reqwest::Response) -> Option<Duration> {
     (secs.is_finite() && secs >= 0.0).then(|| Duration::from_secs_f64(secs))
 }
 
+/// 再試行の方針。同じ要求を投げ直してよいかどうかで分ける。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Retry {
+    /// 何度投げても結果が同じ要求（メッセージの編集）。曖昧な失敗でも試し直す。
+    Idempotent,
+    /// メッセージを作る要求。届いたか分からない失敗で投げ直すと二重投稿になり、
+    /// しかも記録できる message_id は後から作られた方だけなので、先に作られた
+    /// メッセージは続報で差し替えられなくなる。確実に届いていない場合だけ試し直す。
+    CreateOnce,
+}
+
 /// リクエストを送信し、一時的な失敗だけ試し直して成功時の本文を返す。
 ///
 /// 再試行するのは接続エラー・タイムアウトと、429（レート制限）・5xx のみ。
 /// それ以外の 4xx は投げ直しても結果が変わらないため即座に諦める。
+/// ただし `Retry::CreateOnce` では、届いたかどうかが曖昧な失敗（タイムアウトや
+/// 5xx。Discord 側では受理済みかもしれない）では試し直さない。取りこぼしても、
+/// 緊急地震速報は数秒後の続報が新規投稿されるし、地震情報と津波予報は再接続時に
+/// 履歴から拾い直されるため、二重投稿を作るより落とす方を選ぶ。
 /// `new_request` は試行ごとにリクエストを組み直すために毎回呼ばれる。
 async fn send_with_retry(
     new_request: impl Fn() -> reqwest::RequestBuilder,
     payload: &Value,
     image: Option<Vec<u8>>,
     what: &'static str,
+    retry: Retry,
 ) -> Result<String> {
     let mut attempt: u32 = 1;
     let mut wait = RETRY_WAIT;
@@ -407,7 +423,9 @@ async fn send_with_retry(
                 if status.is_success() {
                     return Ok(body);
                 }
-                let retryable = status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error();
+                // 429 は要求が実行されずに弾かれた印なので、投稿の作成でも試し直せる。
+                let retryable = status == StatusCode::TOO_MANY_REQUESTS
+                    || (status.is_server_error() && retry == Retry::Idempotent);
                 if !retryable || last {
                     anyhow::bail!("{what}がエラー応答: {status} {body}");
                 }
@@ -419,7 +437,10 @@ async fn send_with_retry(
                 }
                 warn!(%status, attempt, wait_ms = wait.as_millis() as u64, "{what}に失敗。再試行します");
             }
-            Err(e) if last => return Err(anyhow::Error::new(e).context(what)),
+            // 接続できなかった要求は届いていないので、投稿の作成でも試し直せる。
+            Err(e) if last || (retry == Retry::CreateOnce && !e.is_connect()) => {
+                return Err(anyhow::Error::new(e).context(what));
+            }
             Err(e) => {
                 warn!(error = %e, attempt, wait_ms = wait.as_millis() as u64, "{what}に失敗。再試行します");
             }
@@ -439,7 +460,14 @@ pub async fn send(
     payload: &Value,
     image: Option<Vec<u8>>,
 ) -> Result<()> {
-    send_with_retry(|| client.post(webhook_url), payload, image, "Webhook 送信").await?;
+    send_with_retry(
+        || client.post(webhook_url),
+        payload,
+        image,
+        "Webhook 送信",
+        Retry::CreateOnce,
+    )
+    .await?;
     Ok(())
 }
 
@@ -453,7 +481,14 @@ pub async fn post_message(
     image: Option<Vec<u8>>,
 ) -> Result<String> {
     let url = format!("{webhook_url}?wait=true");
-    let body = send_with_retry(|| client.post(&url), payload, image, "Webhook 投稿").await?;
+    let body = send_with_retry(
+        || client.post(&url),
+        payload,
+        image,
+        "Webhook 投稿",
+        Retry::CreateOnce,
+    )
+    .await?;
     let value: Value = serde_json::from_str(&body).context("Webhook 応答の解析に失敗")?;
     value
         .get("id")
@@ -486,7 +521,14 @@ pub async fn edit_message(
         obj.insert("attachments".to_string(), attachments);
     }
 
-    send_with_retry(|| client.patch(&url), &payload, image, "Webhook 編集").await?;
+    send_with_retry(
+        || client.patch(&url),
+        &payload,
+        image,
+        "Webhook 編集",
+        Retry::Idempotent,
+    )
+    .await?;
     Ok(())
 }
 
