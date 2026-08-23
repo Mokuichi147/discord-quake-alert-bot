@@ -537,12 +537,18 @@ pub async fn post_message(
         Retry::CreateOnce,
     )
     .await?;
-    let value: Value = serde_json::from_str(&body).context("Webhook 応答の解析に失敗")?;
+
+    // ここまで来たということは 2xx が返っており、投稿は作られている。以降の失敗は
+    // message_id が取れないだけなので、投げ直させない（投げ直すと二重投稿になる）。
+    let value: Value = serde_json::from_str(&body)
+        .context("Webhook 応答の解析に失敗")
+        .context(Retryable::Unsafe)?;
     value
         .get("id")
         .and_then(Value::as_str)
         .map(str::to_string)
         .context("Webhook 応答に message id がありません")
+        .context(Retryable::Unsafe)
 }
 
 /// 既存の Webhook メッセージを編集（差し替え）する。
@@ -616,6 +622,45 @@ mod tests {
             .await
             .unwrap_err();
         assert!(!retry_is_safe(&error));
+    }
+
+    /// 1回だけ 200 と `body` を返すサーバを立て、その URL を返す。
+    async fn serve_once(body: &'static str) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            // 要求を読んでから応答する。読まずに閉じると相手の書き込みが失敗する。
+            let mut buf = [0u8; 4096];
+            let _ = socket.read(&mut buf).await;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = socket.write_all(response.as_bytes()).await;
+            let _ = socket.flush().await;
+        });
+        format!("http://{addr}/hook")
+    }
+
+    #[tokio::test]
+    async fn post_with_an_unreadable_response_is_not_safe_to_retry() {
+        // 2xx が返っている＝投稿は作られている。応答の解析に失敗しただけなので、
+        // 投げ直すと二重投稿になる。
+        let http = test_client(Duration::from_secs(5));
+
+        let url = serve_once("これは JSON ではない").await;
+        let error = post_message(&http, &url, &json!({}), None).await.unwrap_err();
+        assert!(!retry_is_safe(&error), "解析に失敗しても投げ直さない");
+
+        // message id が無い応答も同じ。
+        let url = serve_once("{}").await;
+        let error = post_message(&http, &url, &json!({}), None).await.unwrap_err();
+        assert!(!retry_is_safe(&error), "message id が無くても投げ直さない");
     }
 
     #[tokio::test]
