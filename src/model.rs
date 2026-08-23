@@ -3,6 +3,9 @@
 //! WebSocket からは各種 `code` のメッセージが流れてくる。本botでは
 //! `code == 551`（地震情報 = JMAQuake）のみを扱う。
 
+//! APIレスポンスの全フィールドを保持するため、未使用フィールドもデシリアライズする。
+#![allow(dead_code)]
+
 use serde::Deserialize;
 
 /// WebSocket で受信する各メッセージの共通ヘッダ。
