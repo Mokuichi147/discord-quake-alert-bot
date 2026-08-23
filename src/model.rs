@@ -146,8 +146,8 @@ pub struct EewArea {
 #[derive(Debug, Deserialize)]
 pub struct Tsunami {
     pub code: i32,
-    /// WS重複除去用のID。
-    #[serde(default)]
+    /// 重複除去用のID。WebSocket は `_id`、履歴 API は `id` と名前が違うが値は同じ。
+    #[serde(default, alias = "_id")]
     pub id: String,
     /// 津波予報が解除されたか。true の場合 `areas` は空。
     #[serde(default)]

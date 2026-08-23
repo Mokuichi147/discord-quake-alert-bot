@@ -1,7 +1,11 @@
 //! Discord Webhook への通知。embed と地図画像(添付)を送信する。
 
-use anyhow::{Context, Result};
+use std::time::Duration;
+
+use anyhow::{anyhow, Context, Result};
+use reqwest::StatusCode;
 use serde_json::{json, Value};
+use tracing::warn;
 
 use crate::intensity::{
     embed_color, eew_area_scale, eew_max_scale, eew_max_scale_label, eew_scale_label,
@@ -11,6 +15,16 @@ use crate::intensity::{
 use crate::model::{Eew, JmaQuake, Point, Tsunami};
 
 const MAP_FILE_NAME: &str = "quake.webp";
+
+/// 送信を諦めるまでの試行回数。
+///
+/// ネットワーク復帰の直後などは最初の1回だけ失敗することがある。そこで通知を落とすと
+/// 二度と出ないため（緊急地震速報の第1報は特に取り返しがつかない）、数回だけ試し直す。
+const MAX_ATTEMPTS: u32 = 3;
+/// 再試行までの最初の待ち時間。
+const RETRY_WAIT: Duration = Duration::from_millis(500);
+/// 再試行の待ち時間の上限。これより長く待つ必要があるなら通知として手遅れなので諦める。
+const RETRY_WAIT_MAX: Duration = Duration::from_secs(5);
 
 /// 受信した地震情報から Discord embed の payload を組み立てる。
 ///
@@ -358,28 +372,150 @@ fn build_request(
     }
 }
 
-/// レスポンスのステータスを検証し、成功時のみ本文を返す。
-async fn check_response(response: reqwest::Response) -> Result<String> {
-    let status = response.status();
-    let body = response.text().await.unwrap_or_default();
-    if !status.is_success() {
-        anyhow::bail!("Webhook がエラー応答: {status} {body}");
+/// レート制限時に Discord が指示してくる待ち時間（`Retry-After`、秒）。
+fn retry_after(response: &reqwest::Response) -> Option<Duration> {
+    let raw = response
+        .headers()
+        .get(reqwest::header::RETRY_AFTER)?
+        .to_str()
+        .ok()?;
+    let secs: f64 = raw.trim().parse().ok()?;
+    (secs.is_finite() && secs >= 0.0).then(|| Duration::from_secs_f64(secs))
+}
+
+/// 失敗した送信を、呼び出し側が投げ直してよいか。
+///
+/// エラーに付けて返す。投稿の作成が「届いたか分からない」形で失敗した場合だけ
+/// `Unsafe` になり、それ以外は投げ直しても重複しない。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Retryable {
+    /// 投げ直してよい。届いていないと分かっているか、何度投げても結果が同じ。
+    Safe,
+    /// 投げ直すと二重投稿になりうる。Discord 側では受理済みかもしれない。
+    Unsafe,
+}
+
+impl std::fmt::Display for Retryable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Safe => write!(f, "再送可"),
+            Self::Unsafe => write!(f, "再送不可（二重投稿のおそれ）"),
+        }
     }
-    Ok(body)
+}
+
+/// この失敗を投げ直してよいか。判断が付かないものは投げ直してよい扱いにする
+/// （送信まで到達していない失敗なので、重複は起きない）。
+pub fn retry_is_safe(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<Retryable>() != Some(&Retryable::Unsafe)
+}
+
+/// 再試行の方針。同じ要求を投げ直してよいかどうかで分ける。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Retry {
+    /// 何度投げても結果が同じ要求（メッセージの編集）。曖昧な失敗でも試し直す。
+    Idempotent,
+    /// メッセージを作る要求。届いたか分からない失敗で投げ直すと二重投稿になり、
+    /// しかも記録できる message_id は後から作られた方だけなので、先に作られた
+    /// メッセージは続報で差し替えられなくなる。確実に届いていない場合だけ試し直す。
+    CreateOnce,
+}
+
+/// 曖昧な失敗かどうかから、呼び出し側が投げ直してよいかを決める。
+fn classify(ambiguous: bool) -> Retryable {
+    if ambiguous {
+        Retryable::Unsafe
+    } else {
+        Retryable::Safe
+    }
+}
+
+/// リクエストを送信し、一時的な失敗だけ試し直して成功時の本文を返す。
+///
+/// 再試行するのは接続エラー・タイムアウトと、429（レート制限）・5xx のみ。
+/// それ以外の 4xx は投げ直しても結果が変わらないため即座に諦める。
+/// ただし `Retry::CreateOnce` では、届いたかどうかが曖昧な失敗（タイムアウトや
+/// 5xx。Discord 側では受理済みかもしれない）では試し直さない。取りこぼしても、
+/// 緊急地震速報は数秒後の続報が新規投稿されるし、地震情報と津波予報は再接続時に
+/// 履歴から拾い直されるため、二重投稿を作るより落とす方を選ぶ。
+/// `new_request` は試行ごとにリクエストを組み直すために毎回呼ばれる。
+async fn send_with_retry(
+    new_request: impl Fn() -> reqwest::RequestBuilder,
+    payload: &Value,
+    image: Option<Vec<u8>>,
+    what: &'static str,
+    retry: Retry,
+) -> Result<String> {
+    let mut attempt: u32 = 1;
+    let mut wait = RETRY_WAIT;
+    loop {
+        let last = attempt >= MAX_ATTEMPTS;
+        let request = build_request(new_request(), payload, image.clone())?;
+        match request.send().await {
+            Ok(response) => {
+                let status = response.status();
+                let after = retry_after(&response);
+                let body = response.text().await.unwrap_or_default();
+                if status.is_success() {
+                    return Ok(body);
+                }
+                // 429 は要求が実行されずに弾かれた印なので、投稿の作成でも試し直せる。
+                let retryable = status == StatusCode::TOO_MANY_REQUESTS
+                    || (status.is_server_error() && retry == Retry::Idempotent);
+                if !retryable || last {
+                    // 5xx は Discord 側で受理済みかもしれない。投稿の作成なら、
+                    // 呼び出し側にも投げ直させない。
+                    let ambiguous = status.is_server_error() && retry == Retry::CreateOnce;
+                    return Err(anyhow!("{what}がエラー応答: {status} {body}"))
+                        .context(classify(ambiguous));
+                }
+                if let Some(after) = after {
+                    if after > RETRY_WAIT_MAX {
+                        // 429 は弾かれているので、投げ直しても重複はしない。
+                        return Err(anyhow!(
+                            "{what}がレート制限: {after:?} の待機が必要なため諦めます"
+                        ))
+                        .context(Retryable::Safe);
+                    }
+                    wait = after;
+                }
+                warn!(%status, attempt, wait_ms = wait.as_millis() as u64, "{what}に失敗。再試行します");
+            }
+            // 接続できなかった要求は届いていないので、投稿の作成でも試し直せる。
+            Err(e) if last || (retry == Retry::CreateOnce && !e.is_connect()) => {
+                // タイムアウトなどは Discord 側で受理済みかもしれない。
+                let ambiguous = retry == Retry::CreateOnce && !e.is_connect();
+                return Err(anyhow::Error::new(e))
+                    .context(what)
+                    .context(classify(ambiguous));
+            }
+            Err(e) => {
+                warn!(error = %e, attempt, wait_ms = wait.as_millis() as u64, "{what}に失敗。再試行します");
+            }
+        }
+        tokio::time::sleep(wait).await;
+        wait = (wait * 3).min(RETRY_WAIT_MAX);
+        attempt += 1;
+    }
 }
 
 /// Webhook に送信する。`image` がある場合は multipart で画像を添付する。
 ///
-/// message_id を必要としない通知（緊急地震速報・津波予報）向け。
+/// message_id を必要としない通知（緊急地震速報の取消・津波予報）向け。
 pub async fn send(
     client: &reqwest::Client,
     webhook_url: &str,
     payload: &Value,
     image: Option<Vec<u8>>,
 ) -> Result<()> {
-    let request = build_request(client.post(webhook_url), payload, image)?;
-    let response = request.send().await.context("Webhook 送信に失敗")?;
-    check_response(response).await?;
+    send_with_retry(
+        || client.post(webhook_url),
+        payload,
+        image,
+        "Webhook 送信",
+        Retry::CreateOnce,
+    )
+    .await?;
     Ok(())
 }
 
@@ -393,15 +529,26 @@ pub async fn post_message(
     image: Option<Vec<u8>>,
 ) -> Result<String> {
     let url = format!("{webhook_url}?wait=true");
-    let request = build_request(client.post(&url), payload, image)?;
-    let response = request.send().await.context("Webhook 投稿に失敗")?;
-    let body = check_response(response).await?;
-    let value: Value = serde_json::from_str(&body).context("Webhook 応答の解析に失敗")?;
+    let body = send_with_retry(
+        || client.post(&url),
+        payload,
+        image,
+        "Webhook 投稿",
+        Retry::CreateOnce,
+    )
+    .await?;
+
+    // ここまで来たということは 2xx が返っており、投稿は作られている。以降の失敗は
+    // message_id が取れないだけなので、投げ直させない（投げ直すと二重投稿になる）。
+    let value: Value = serde_json::from_str(&body)
+        .context("Webhook 応答の解析に失敗")
+        .context(Retryable::Unsafe)?;
     value
         .get("id")
         .and_then(Value::as_str)
         .map(str::to_string)
         .context("Webhook 応答に message id がありません")
+        .context(Retryable::Unsafe)
 }
 
 /// 既存の Webhook メッセージを編集（差し替え）する。
@@ -428,15 +575,103 @@ pub async fn edit_message(
         obj.insert("attachments".to_string(), attachments);
     }
 
-    let request = build_request(client.patch(&url), &payload, image)?;
-    let response = request.send().await.context("Webhook 編集に失敗")?;
-    check_response(response).await?;
+    send_with_retry(
+        || client.patch(&url),
+        &payload,
+        image,
+        "Webhook 編集",
+        Retry::Idempotent,
+    )
+    .await?;
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// プロキシの自動検出は macOS で panic することがあるため無効にする。
+    fn test_client(timeout: Duration) -> reqwest::Client {
+        reqwest::Client::builder()
+            .no_proxy()
+            .timeout(timeout)
+            .build()
+            .unwrap()
+    }
+
+    #[test]
+    fn retry_is_safe_unless_the_post_may_have_landed() {
+        assert!(!retry_is_safe(&anyhow!("失敗").context(Retryable::Unsafe)));
+        assert!(retry_is_safe(&anyhow!("失敗").context(Retryable::Safe)));
+        // 送信まで到達していない失敗には印が付かない。投げ直しても重複しない。
+        assert!(retry_is_safe(&anyhow!("印の無い失敗")));
+    }
+
+    #[tokio::test]
+    async fn post_that_may_have_landed_is_not_safe_to_retry() {
+        // 応答が返らない＝Discord 側で受理済みかもしれない。投げ直すと二重投稿。
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _accepted = listener.accept().await;
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        });
+
+        let http = test_client(Duration::from_millis(200));
+        let error = post_message(&http, &format!("http://{addr}/hook"), &json!({}), None)
+            .await
+            .unwrap_err();
+        assert!(!retry_is_safe(&error));
+    }
+
+    /// 1回だけ 200 と `body` を返すサーバを立て、その URL を返す。
+    async fn serve_once(body: &'static str) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            // 要求を読んでから応答する。読まずに閉じると相手の書き込みが失敗する。
+            let mut buf = [0u8; 4096];
+            let _ = socket.read(&mut buf).await;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = socket.write_all(response.as_bytes()).await;
+            let _ = socket.flush().await;
+        });
+        format!("http://{addr}/hook")
+    }
+
+    #[tokio::test]
+    async fn post_with_an_unreadable_response_is_not_safe_to_retry() {
+        // 2xx が返っている＝投稿は作られている。応答の解析に失敗しただけなので、
+        // 投げ直すと二重投稿になる。
+        let http = test_client(Duration::from_secs(5));
+
+        let url = serve_once("これは JSON ではない").await;
+        let error = post_message(&http, &url, &json!({}), None).await.unwrap_err();
+        assert!(!retry_is_safe(&error), "解析に失敗しても投げ直さない");
+
+        // message id が無い応答も同じ。
+        let url = serve_once("{}").await;
+        let error = post_message(&http, &url, &json!({}), None).await.unwrap_err();
+        assert!(!retry_is_safe(&error), "message id が無くても投げ直さない");
+    }
+
+    #[tokio::test]
+    async fn post_that_never_connected_is_safe_to_retry() {
+        // 接続できていないので、投げ直しても重複しない。
+        let http = test_client(Duration::from_millis(200));
+        let error = post_message(&http, "http://127.0.0.1:1/hook", &json!({}), None)
+            .await
+            .unwrap_err();
+        assert!(retry_is_safe(&error));
+    }
 
     fn pt(pref: &str, addr: &str, scale: i32) -> Point {
         Point {
