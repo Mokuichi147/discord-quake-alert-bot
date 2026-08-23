@@ -78,8 +78,12 @@ const FAILED_RETRY_INTERVAL: Duration = Duration::from_secs(60);
 const WORKER_QUEUE_CAPACITY: usize = 256;
 
 /// 緊急地震速報の待ち行列に載せる地震の数の上限。
-/// 同時に進行している地震の数だけあれば足りる（通常は1〜2件）。
-const EEW_QUEUE_CAPACITY: usize = 32;
+///
+/// 同時に進行している地震の数だけあれば足りる（通常は1〜2件）ので、これは
+/// メモリを守るための最後の歯止め。1件あたり数 KB なので、上限に達しても
+/// 1MB 程度に収まる。上限を超えたときはまず鮮度切れの報を掃除するため、
+/// まだ通知できる報を捨てるのは、この数の地震が同時進行した場合だけ。
+const EEW_QUEUE_CAPACITY: usize = 256;
 
 /// 緊急地震速報の送信に失敗したときの、積み直しの間隔と回数の上限。
 /// 履歴から拾い直せない種別なので、鮮度が残っている間は送り直す。
@@ -401,11 +405,18 @@ fn spawn_eew_worker(config: Config, http: reqwest::Client, queue: EewQueue) {
 
             // 履歴から拾い直せない種別なので、鮮度が残っている間は送り直す。
             // 続報が来ない単発の初報は、ここで捨てると永久に失われる。
-            let give_up = pending.attempts + 1 >= EEW_MAX_ATTEMPTS;
+            //
+            // ただし Discord 側で受理済みかもしれない失敗（新規投稿のタイムアウト・
+            // 5xx）では送り直さない。投げ直すと二重投稿になり、しかも記録できる
+            // message_id は後から作られた方だけなので、先の投稿を続報で差し替え
+            // られなくなる。
+            let safe = discord::retry_is_safe(&e);
+            let give_up = !safe || pending.attempts + 1 >= EEW_MAX_ATTEMPTS;
             error!(
                 error = %e,
                 event_id = %pending.event_id,
                 attempts = pending.attempts + 1,
+                retry_is_safe = safe,
                 give_up,
                 "緊急地震速報の処理に失敗"
             );
@@ -625,17 +636,21 @@ impl EewQueue {
                 }
                 None => {
                     queue.push_back(pending);
-                    // ここまで溜まるのは異常だが、際限なく積み上がらないよう
-                    // 上限を設ける。捨てるのは最も古い＝最も価値の低い報。
                     if queue.len() > EEW_QUEUE_CAPACITY {
-                        if let Some(dropped) = queue.pop_front() {
-                            let total = self.dropped.fetch_add(1, Ordering::Relaxed) + 1;
-                            error!(
-                                event_id = %dropped.event_id,
-                                dropped_total = total,
-                                "待ち行列が溢れたため古い緊急地震速報を捨てました"
-                            );
-                        }
+                        // まず鮮度切れを掃除する。これらは取り出しても投稿せずに
+                        // 捨てる報なので、ここで外しても通知は失われない。
+                        queue.retain(|p| p.received.elapsed() <= EEW_MAX_AGE);
+                    }
+                    // それでも収まらない場合の最後の歯止め。鮮度の残る報を
+                    // 捨てることになるので、起きたら分かるよう数える。
+                    while queue.len() > EEW_QUEUE_CAPACITY {
+                        let Some(dropped) = queue.pop_front() else { break };
+                        let total = self.dropped.fetch_add(1, Ordering::Relaxed) + 1;
+                        error!(
+                            event_id = %dropped.event_id,
+                            dropped_total = total,
+                            "待ち行列が溢れたため古い緊急地震速報を捨てました"
+                        );
                     }
                 }
             }
@@ -1769,6 +1784,32 @@ mod tests {
         assert_eq!(queue.lock().len(), EEW_QUEUE_CAPACITY);
         // 捨てられるのは最も古い＝最も価値の低い報。
         assert_eq!(queue.lock()[0].event_id, "ev10");
+    }
+
+    #[test]
+    fn stale_reports_are_purged_before_dropping_fresh_ones() {
+        // 上限に達したとき、まず捨てるのは鮮度切れ（取り出しても投稿しない報）。
+        let Some(stale) = Instant::now().checked_sub(EEW_MAX_AGE + Duration::from_secs(1)) else {
+            // 起動直後の環境では過去の時刻を作れないため、この確認は省く。
+            return;
+        };
+        let queue = EewQueue::default();
+        for event in 0..EEW_QUEUE_CAPACITY {
+            queue.push(format!("old{event}"), true, incoming(CODE_EEW, "e"));
+        }
+        for pending in queue.lock().iter_mut() {
+            pending.received = stale;
+        }
+
+        queue.push("fresh".to_string(), true, incoming(CODE_EEW, "e"));
+        let queued = queue.lock();
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].event_id, "fresh");
+        assert_eq!(
+            queue.dropped.load(Ordering::Relaxed),
+            0,
+            "鮮度切れの掃除は破棄として数えない"
+        );
     }
 
     #[tokio::test]

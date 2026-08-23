@@ -2,7 +2,7 @@
 
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use reqwest::StatusCode;
 use serde_json::{json, Value};
 use tracing::warn;
@@ -383,6 +383,33 @@ fn retry_after(response: &reqwest::Response) -> Option<Duration> {
     (secs.is_finite() && secs >= 0.0).then(|| Duration::from_secs_f64(secs))
 }
 
+/// 失敗した送信を、呼び出し側が投げ直してよいか。
+///
+/// エラーに付けて返す。投稿の作成が「届いたか分からない」形で失敗した場合だけ
+/// `Unsafe` になり、それ以外は投げ直しても重複しない。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Retryable {
+    /// 投げ直してよい。届いていないと分かっているか、何度投げても結果が同じ。
+    Safe,
+    /// 投げ直すと二重投稿になりうる。Discord 側では受理済みかもしれない。
+    Unsafe,
+}
+
+impl std::fmt::Display for Retryable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Safe => write!(f, "再送可"),
+            Self::Unsafe => write!(f, "再送不可（二重投稿のおそれ）"),
+        }
+    }
+}
+
+/// この失敗を投げ直してよいか。判断が付かないものは投げ直してよい扱いにする
+/// （送信まで到達していない失敗なので、重複は起きない）。
+pub fn retry_is_safe(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<Retryable>() != Some(&Retryable::Unsafe)
+}
+
 /// 再試行の方針。同じ要求を投げ直してよいかどうかで分ける。
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Retry {
@@ -392,6 +419,15 @@ enum Retry {
     /// しかも記録できる message_id は後から作られた方だけなので、先に作られた
     /// メッセージは続報で差し替えられなくなる。確実に届いていない場合だけ試し直す。
     CreateOnce,
+}
+
+/// 曖昧な失敗かどうかから、呼び出し側が投げ直してよいかを決める。
+fn classify(ambiguous: bool) -> Retryable {
+    if ambiguous {
+        Retryable::Unsafe
+    } else {
+        Retryable::Safe
+    }
 }
 
 /// リクエストを送信し、一時的な失敗だけ試し直して成功時の本文を返す。
@@ -427,11 +463,19 @@ async fn send_with_retry(
                 let retryable = status == StatusCode::TOO_MANY_REQUESTS
                     || (status.is_server_error() && retry == Retry::Idempotent);
                 if !retryable || last {
-                    anyhow::bail!("{what}がエラー応答: {status} {body}");
+                    // 5xx は Discord 側で受理済みかもしれない。投稿の作成なら、
+                    // 呼び出し側にも投げ直させない。
+                    let ambiguous = status.is_server_error() && retry == Retry::CreateOnce;
+                    return Err(anyhow!("{what}がエラー応答: {status} {body}"))
+                        .context(classify(ambiguous));
                 }
                 if let Some(after) = after {
                     if after > RETRY_WAIT_MAX {
-                        anyhow::bail!("{what}がレート制限: {after:?} の待機が必要なため諦めます");
+                        // 429 は弾かれているので、投げ直しても重複はしない。
+                        return Err(anyhow!(
+                            "{what}がレート制限: {after:?} の待機が必要なため諦めます"
+                        ))
+                        .context(Retryable::Safe);
                     }
                     wait = after;
                 }
@@ -439,7 +483,11 @@ async fn send_with_retry(
             }
             // 接続できなかった要求は届いていないので、投稿の作成でも試し直せる。
             Err(e) if last || (retry == Retry::CreateOnce && !e.is_connect()) => {
-                return Err(anyhow::Error::new(e).context(what));
+                // タイムアウトなどは Discord 側で受理済みかもしれない。
+                let ambiguous = retry == Retry::CreateOnce && !e.is_connect();
+                return Err(anyhow::Error::new(e))
+                    .context(what)
+                    .context(classify(ambiguous));
             }
             Err(e) => {
                 warn!(error = %e, attempt, wait_ms = wait.as_millis() as u64, "{what}に失敗。再試行します");
@@ -535,6 +583,50 @@ pub async fn edit_message(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// プロキシの自動検出は macOS で panic することがあるため無効にする。
+    fn test_client(timeout: Duration) -> reqwest::Client {
+        reqwest::Client::builder()
+            .no_proxy()
+            .timeout(timeout)
+            .build()
+            .unwrap()
+    }
+
+    #[test]
+    fn retry_is_safe_unless_the_post_may_have_landed() {
+        assert!(!retry_is_safe(&anyhow!("失敗").context(Retryable::Unsafe)));
+        assert!(retry_is_safe(&anyhow!("失敗").context(Retryable::Safe)));
+        // 送信まで到達していない失敗には印が付かない。投げ直しても重複しない。
+        assert!(retry_is_safe(&anyhow!("印の無い失敗")));
+    }
+
+    #[tokio::test]
+    async fn post_that_may_have_landed_is_not_safe_to_retry() {
+        // 応答が返らない＝Discord 側で受理済みかもしれない。投げ直すと二重投稿。
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _accepted = listener.accept().await;
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        });
+
+        let http = test_client(Duration::from_millis(200));
+        let error = post_message(&http, &format!("http://{addr}/hook"), &json!({}), None)
+            .await
+            .unwrap_err();
+        assert!(!retry_is_safe(&error));
+    }
+
+    #[tokio::test]
+    async fn post_that_never_connected_is_safe_to_retry() {
+        // 接続できていないので、投げ直しても重複しない。
+        let http = test_client(Duration::from_millis(200));
+        let error = post_message(&http, "http://127.0.0.1:1/hook", &json!({}), None)
+            .await
+            .unwrap_err();
+        assert!(retry_is_safe(&error));
+    }
 
     fn pt(pref: &str, addr: &str, scale: i32) -> Point {
         Point {
