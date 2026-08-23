@@ -13,6 +13,7 @@ mod model;
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -79,6 +80,11 @@ const WORKER_QUEUE_CAPACITY: usize = 256;
 /// 緊急地震速報の待ち行列に載せる地震の数の上限。
 /// 同時に進行している地震の数だけあれば足りる（通常は1〜2件）。
 const EEW_QUEUE_CAPACITY: usize = 32;
+
+/// 緊急地震速報の送信に失敗したときの、積み直しの間隔と回数の上限。
+/// 履歴から拾い直せない種別なので、鮮度が残っている間は送り直す。
+const EEW_RETRY_DELAY: Duration = Duration::from_secs(5);
+const EEW_MAX_ATTEMPTS: u32 = 5;
 
 /// 緊急地震速報を通知する意味がある時間。
 ///
@@ -382,10 +388,31 @@ fn spawn_eew_worker(config: Config, http: reqwest::Client, queue: EewQueue) {
                 );
                 continue;
             }
-            let result =
-                handle_eew(&config, &http, &pending.message.text, false, &mut tracker).await;
-            if let Err(e) = result {
-                error!(error = %e, event_id = %pending.event_id, "緊急地震速報の処理に失敗");
+            let result = handle_eew(
+                &config,
+                &http,
+                &pending.message.text,
+                false,
+                &mut tracker,
+                pending.notifiable,
+            )
+            .await;
+            let Err(e) = result else { continue };
+
+            // 履歴から拾い直せない種別なので、鮮度が残っている間は送り直す。
+            // 続報が来ない単発の初報は、ここで捨てると永久に失われる。
+            let give_up = pending.attempts + 1 >= EEW_MAX_ATTEMPTS;
+            error!(
+                error = %e,
+                event_id = %pending.event_id,
+                attempts = pending.attempts + 1,
+                give_up,
+                "緊急地震速報の処理に失敗"
+            );
+            if !give_up {
+                queue.retry(pending);
+                // すぐ取り出して叩き直さないよう、少し置いてから次へ進む。
+                tokio::time::sleep(EEW_RETRY_DELAY).await;
             }
         }
     });
@@ -500,7 +527,7 @@ async fn run_once(
             }
         };
         match message {
-            Message::Text(text) => dispatch(&text, eew_queue, other_tx, cursors),
+            Message::Text(text) => dispatch(&text, eew_queue, other_tx, cursors, config),
             Message::Ping(_) | Message::Pong(_) => {}
             Message::Close(_) => {
                 info!("サーバから切断通知を受信");
@@ -530,6 +557,15 @@ struct PendingEew {
     event_id: String,
     /// 受信した時刻。古くなった報を捨てる判断に使う。
     received: Instant,
+    /// 束ねた報のいずれかが単体で通知条件を満たしたか。
+    ///
+    /// 初報が条件を満たし、処理前に届いた続報が下方修正だった場合、単純に
+    /// 差し替えると「条件を満たしたのに一度も通知されない」ことになる。この印が
+    /// 立っていれば、引き下げ後の内容で通知する（通知後に引き下げられた場合と
+    /// 同じ最終状態になる）。
+    notifiable: bool,
+    /// 送信に失敗して積み直した回数。
+    attempts: u32,
     message: Incoming,
 }
 
@@ -545,28 +581,58 @@ struct PendingEew {
 struct EewQueue {
     inner: Arc<Mutex<VecDeque<PendingEew>>>,
     ready: Arc<tokio::sync::Notify>,
+    /// 上限を超えて捨てた地震の数。異常に気付けるよう積算する。
+    dropped: Arc<AtomicUsize>,
 }
 
 impl EewQueue {
     /// 受信した報を積む。同じ地震の報が既にあれば差し替える。
-    fn push(&self, event_id: String, message: Incoming) {
+    ///
+    /// `notifiable` は、この報が単体で通知条件を満たすか。差し替えても失われない
+    /// よう、束ねた分の論理和を保つ。
+    fn push(&self, event_id: String, notifiable: bool, message: Incoming) {
         let pending = PendingEew {
             event_id,
             received: Instant::now(),
+            notifiable,
+            attempts: 0,
             message,
         };
+        self.insert(pending, true);
+    }
+
+    /// 送信に失敗した報を積み直す。受信時刻は引き継ぎ、鮮度の判定を狂わせない。
+    ///
+    /// 同じ地震の新しい報が既に積まれている場合はそちらを優先し、条件を満たした
+    /// 事実だけを引き継ぐ。
+    fn retry(&self, mut pending: PendingEew) {
+        pending.attempts += 1;
+        self.insert(pending, false);
+    }
+
+    /// 待ち行列へ入れる。`replace` が false なら既存の報を上書きしない。
+    fn insert(&self, pending: PendingEew, replace: bool) {
         {
             let mut queue = self.lock();
             match queue.iter_mut().find(|p| p.event_id == pending.event_id) {
-                Some(slot) => *slot = pending,
+                Some(slot) => {
+                    // 条件を満たした事実はどちらの報からも失わない。
+                    let notifiable = slot.notifiable || pending.notifiable;
+                    if replace {
+                        *slot = pending;
+                    }
+                    slot.notifiable = notifiable;
+                }
                 None => {
                     queue.push_back(pending);
                     // ここまで溜まるのは異常だが、際限なく積み上がらないよう
                     // 上限を設ける。捨てるのは最も古い＝最も価値の低い報。
                     if queue.len() > EEW_QUEUE_CAPACITY {
                         if let Some(dropped) = queue.pop_front() {
+                            let total = self.dropped.fetch_add(1, Ordering::Relaxed) + 1;
                             error!(
                                 event_id = %dropped.event_id,
+                                dropped_total = total,
                                 "待ち行列が溢れたため古い緊急地震速報を捨てました"
                             );
                         }
@@ -736,6 +802,7 @@ fn dispatch(
     eew_queue: &EewQueue,
     other_tx: &mpsc::Sender<Job>,
     cursors: &Cursors,
+    config: &Config,
 ) {
     // 想定外のフォーマットは無視する。
     let Ok(value) = serde_json::from_str::<serde_json::Value>(text) else {
@@ -759,10 +826,23 @@ fn dispatch(
         let Some(event_id) = event_id(&value) else {
             return;
         };
-        eew_queue.push(event_id.to_string(), message);
+        eew_queue.push(event_id.to_string(), eew_notifiable(text, config), message);
         return;
     }
     enqueue(other_tx, cursors, message);
+}
+
+/// この報が単体で通知条件を満たすか。
+///
+/// 待ち行列で続報に差し替えられても「条件を満たす報があった」ことを残すために使う。
+fn eew_notifiable(text: &str, config: &Config) -> bool {
+    let Ok(eew) = serde_json::from_str::<Eew>(text) else {
+        return false;
+    };
+    if eew.cancelled {
+        return false;
+    }
+    decide_eew(&eew.areas, &config.region_min_scales, config.other_min_scale).notify
 }
 
 /// 緊急地震速報の eventId。同一地震の続報を束ねる。
@@ -1037,7 +1117,7 @@ async fn run_test_eew(config: &Config, http: &reqwest::Client) -> Result<()> {
                 reason = %decision.reason,
                 "テスト送信する緊急地震速報を選択しました"
             );
-            handle_eew(config, http, &text, true, &mut tracker).await?;
+            handle_eew(config, http, &text, true, &mut tracker, false).await?;
             info!("テスト送信が完了しました");
             return Ok(());
         }
@@ -1094,7 +1174,7 @@ async fn handle_text(
 
     match envelope.code {
         CODE_JMA_QUAKE => handle_quake(config, http, text, is_test, &mut dedup.quakes).await,
-        CODE_EEW => handle_eew(config, http, text, is_test, &mut dedup.eews).await,
+        CODE_EEW => handle_eew(config, http, text, is_test, &mut dedup.eews, false).await,
         CODE_TSUNAMI => handle_tsunami(config, http, text, is_test, &mut dedup.tsunamis).await,
         _ => Ok(()),
     }
@@ -1259,6 +1339,7 @@ async fn handle_eew(
     text: &str,
     is_test: bool,
     tracker: &mut EewTracker,
+    force: bool,
 ) -> Result<()> {
     let eew: Eew = serde_json::from_str(text)?;
     let event_id = eew.issue.event_id.clone();
@@ -1285,7 +1366,11 @@ async fn handle_eew(
 
     // 未通知のまま基準を下回る報は無視する。通知済みなら、基準を下回った続報でも
     // 差し替える。捨ててしまうと、引き下げられた予想が反映されず古い内容が残る。
-    if !decision.notify && !posted {
+    //
+    // `force` は、待ち行列で束ねた報のいずれかが基準を満たしていた場合に立つ。
+    // 通知してから引き下げられた場合と同じ最終状態にするため、引き下げ後の内容で
+    // 通知する（束ねたせいで一度も通知されない、ということが起きないようにする）。
+    if !decision.notify && !posted && !force {
         return Ok(());
     }
 
@@ -1484,6 +1569,25 @@ mod tests {
         }
     }
 
+    /// 送信先が必ず失敗する設定。しきい値は震度5強。
+    fn test_config() -> Config {
+        Config {
+            webhook_url: "http://127.0.0.1:1/failing-webhook".to_string(),
+            ws_url: String::new(),
+            region_min_scales: HashMap::new(),
+            other_min_scale: 50,
+            attach_map: false,
+            tile_url_template: String::new(),
+        }
+    }
+
+    /// 予想震度が一律 `scale` の緊急地震速報。
+    fn eew_text(id: &str, event_id: &str, scale: i32) -> String {
+        format!(
+            r#"{{"code":556,"_id":"{id}","issue":{{"eventId":"{event_id}"}},"areas":[{{"pref":"熊本","name":"熊本県熊本","scaleFrom":{scale},"scaleTo":{scale}}}]}}"#
+        )
+    }
+
     fn incoming(code: i32, id: &str) -> Incoming {
         Incoming {
             code,
@@ -1506,14 +1610,16 @@ mod tests {
         let (other_tx, mut other_rx) = mpsc::channel(4);
         let cursors = Cursors::default();
 
+        let config = test_config();
+
         let eew = r#"{"code":556,"_id":"e1","issue":{"eventId":"ev1"}}"#;
-        dispatch(eew, &eew_queue, &other_tx, &cursors);
-        dispatch(r#"{"code":551,"_id":"q1"}"#, &eew_queue, &other_tx, &cursors);
-        dispatch(r#"{"code":552,"_id":"t1"}"#, &eew_queue, &other_tx, &cursors);
+        dispatch(eew, &eew_queue, &other_tx, &cursors, &config);
+        dispatch(r#"{"code":551,"_id":"q1"}"#, &eew_queue, &other_tx, &cursors, &config);
+        dispatch(r#"{"code":552,"_id":"t1"}"#, &eew_queue, &other_tx, &cursors, &config);
         // 対象外の code、壊れた JSON、eventId の無い緊急地震速報は捨てる。
-        dispatch(r#"{"code":555}"#, &eew_queue, &other_tx, &cursors);
-        dispatch("not json", &eew_queue, &other_tx, &cursors);
-        dispatch(r#"{"code":556,"_id":"e2"}"#, &eew_queue, &other_tx, &cursors);
+        dispatch(r#"{"code":555}"#, &eew_queue, &other_tx, &cursors, &config);
+        dispatch("not json", &eew_queue, &other_tx, &cursors, &config);
+        dispatch(r#"{"code":556,"_id":"e2"}"#, &eew_queue, &other_tx, &cursors, &config);
 
         // 緊急地震速報は地震情報と別の待ち行列に入り、地図生成に待たされない。
         assert_eq!(eew_queue.lock().len(), 1);
@@ -1590,19 +1696,12 @@ mod tests {
         let (other_tx, _other_rx) = mpsc::channel(4);
         let cursors = Cursors::default();
 
+        let config = test_config();
         for serial in 1..=50 {
-            let text = format!(
-                r#"{{"code":556,"_id":"e{serial}","issue":{{"eventId":"ev1","serial":"{serial}"}}}}"#
-            );
-            dispatch(&text, &queue, &other_tx, &cursors);
+            dispatch(&eew_text(&format!("e{serial}"), "ev1", 50), &queue, &other_tx, &cursors, &config);
         }
         // 別の地震は別の枠になる。
-        dispatch(
-            r#"{"code":556,"_id":"x1","issue":{"eventId":"ev2"}}"#,
-            &queue,
-            &other_tx,
-            &cursors,
-        );
+        dispatch(&eew_text("x1", "ev2", 50), &queue, &other_tx, &cursors, &config);
 
         assert_eq!(queue.lock().len(), 2, "地震ごとに1件だけ持つ");
         assert_eq!(queue.lock()[0].event_id, "ev1");
@@ -1610,12 +1709,63 @@ mod tests {
     }
 
     #[test]
+    fn downgraded_follow_up_keeps_the_initial_report_notifiable() {
+        // 初報が条件を満たし、処理前に届いた続報が下方修正だった場合。単純に
+        // 差し替えると、条件を満たしたのに一度も通知されないことになる。
+        let queue = EewQueue::default();
+        let (other_tx, _other_rx) = mpsc::channel(4);
+        let cursors = Cursors::default();
+        let config = test_config();
+
+        dispatch(&eew_text("e1", "ev1", 50), &queue, &other_tx, &cursors, &config);
+        assert!(queue.lock()[0].notifiable, "初報は条件を満たす");
+
+        dispatch(&eew_text("e2", "ev1", 40), &queue, &other_tx, &cursors, &config);
+        let queued = queue.lock();
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].message.id.as_deref(), Some("e2"), "内容は最新の報");
+        assert!(queued[0].notifiable, "条件を満たした事実は残る");
+    }
+
+    #[test]
+    fn failed_report_is_requeued_without_resetting_its_age() {
+        // 緊急地震速報は履歴から拾い直せないので、送信に失敗したら積み直す。
+        let queue = EewQueue::default();
+        queue.push("ev1".to_string(), true, incoming(CODE_EEW, "e1"));
+        let pending = queue.lock().pop_front().unwrap();
+        let received = pending.received;
+
+        queue.retry(pending);
+        let queued = queue.lock();
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].attempts, 1);
+        assert_eq!(queued[0].received, received, "鮮度の判定を狂わせない");
+        assert!(queued[0].notifiable);
+    }
+
+    #[test]
+    fn a_newer_report_wins_over_a_retried_one() {
+        // 積み直す間に続報が届いていたら、新しい方を投稿する。
+        let queue = EewQueue::default();
+        queue.push("ev1".to_string(), true, incoming(CODE_EEW, "old"));
+        let failed = queue.lock().pop_front().unwrap();
+        queue.push("ev1".to_string(), false, incoming(CODE_EEW, "new"));
+
+        queue.retry(failed);
+        let queued = queue.lock();
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].message.id.as_deref(), Some("new"), "新しい報を優先");
+        assert!(queued[0].notifiable, "条件を満たした事実は引き継ぐ");
+    }
+
+    #[test]
     fn eew_queue_bounds_the_number_of_events() {
         // 同時にこれだけの地震が進行することは無いが、際限なく積み上がらないこと。
         let queue = EewQueue::default();
         for event in 0..(EEW_QUEUE_CAPACITY + 10) {
-            queue.push(format!("ev{event}"), incoming(CODE_EEW, "e"));
+            queue.push(format!("ev{event}"), true, incoming(CODE_EEW, "e"));
         }
+        assert_eq!(queue.dropped.load(Ordering::Relaxed), 10, "捨てた数を数える");
         assert_eq!(queue.lock().len(), EEW_QUEUE_CAPACITY);
         // 捨てられるのは最も古い＝最も価値の低い報。
         assert_eq!(queue.lock()[0].event_id, "ev10");
@@ -1629,7 +1779,7 @@ mod tests {
             async move { queue.pop().await.event_id }
         });
         tokio::time::sleep(Duration::from_millis(50)).await;
-        queue.push("ev1".to_string(), incoming(CODE_EEW, "e1"));
+        queue.push("ev1".to_string(), true, incoming(CODE_EEW, "e1"));
         assert_eq!(waiting.await.unwrap(), "ev1");
     }
 
@@ -1682,14 +1832,7 @@ mod tests {
     async fn tsunami_is_not_marked_seen_when_sending_fails() {
         // 送信前に記録すると、失敗した発表が再送や履歴からの拾い直しでも重複扱いに
         // なり、通知が永久に失われる。
-        let config = Config {
-            webhook_url: "http://127.0.0.1:1/failing-webhook".to_string(),
-            ws_url: String::new(),
-            region_min_scales: HashMap::new(),
-            other_min_scale: 10,
-            attach_map: false,
-            tile_url_template: String::new(),
-        };
+        let config = test_config();
         // macOS ではプロキシの自動検出が panic することがあるため無効にする。
         // 送信先は 127.0.0.1 なのでプロキシは不要。
         let http = reqwest::Client::builder().no_proxy().build().unwrap();
