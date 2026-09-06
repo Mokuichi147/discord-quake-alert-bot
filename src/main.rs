@@ -21,9 +21,9 @@ use anyhow::{anyhow, Result};
 use futures_util::StreamExt;
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
-use tracing::{error, info, warn};
+use tracing::{error, info, warn, Instrument};
 
-use crate::config::Config;
+use crate::config::{Config, WebhookConfig};
 use crate::intensity::{decide, decide_eew, eew_max_scale, eew_summary, tsunami_grade_rank};
 use crate::model::{Eew, Envelope, JmaQuake, Tsunami};
 
@@ -257,9 +257,7 @@ async fn main() -> Result<()> {
     let config = Config::from_env()?;
     info!(
         ws_url = %config.ws_url,
-        regions = config.region_min_scales.len(),
-        other_min = config.other_min_scale,
-        attach_map = config.attach_map,
+        webhooks = config.webhooks.len(),
         "地震botを起動しました"
     );
 
@@ -268,35 +266,44 @@ async fn main() -> Result<()> {
         .timeout(Duration::from_secs(30))
         .build()?;
 
-    // テストモード: 過去のデータを1件取得して送信し終了する。
-    if std::env::args().any(|a| a == "--test-tsunami") {
-        return run_test_tsunami(&config, &http).await;
-    }
-    if std::env::args().any(|a| a == "--test-eew") {
-        return run_test_eew(&config, &http).await;
-    }
-    if std::env::args().any(|a| a == "--test-prompt") {
-        return run_test_prompt(&config, &http).await;
-    }
-    if std::env::args().any(|a| a == "--test") {
-        return run_test(&config, &http).await;
+    // テストモードも全送信先の設定を使う。1件の失敗でほかの送信を中断しない。
+    let args: Vec<String> = std::env::args().collect();
+    if let Some(mode) = ["--test-tsunami", "--test-eew", "--test-prompt", "--test"]
+        .into_iter()
+        .find(|mode| args.iter().any(|arg| arg == mode))
+    {
+        let results = futures_util::future::join_all(config.webhooks.iter().map(|hook| {
+            let http = &http;
+            async move {
+                match mode {
+                    "--test-tsunami" => run_test_tsunami(hook, http).await,
+                    "--test-eew" => run_test_eew(hook, http).await,
+                    "--test-prompt" => run_test_prompt(hook, http).await,
+                    _ => run_test(hook, http).await,
+                }
+            }
+            .instrument(tracing::info_span!("webhook", name = %hook.name))
+        }))
+        .await;
+        for result in results {
+            result?;
+        }
+        return Ok(());
     }
 
-    // 受信と通知処理を分ける。受信ループは届いたテキストをワーカーへ渡すだけにし、
-    // 地図生成や Discord 送信で止まらないようにする（理由は run_once を参照）。
-    // 重複抑制の状態は種別ごとに独立しているため、緊急地震速報だけ別ワーカーにしても
-    // 支障はない。地図生成の重い地震情報(551)に速報が待たされるのを避ける。
-    // 通知まで終えた最新のメッセージ id。切断中に流れた分を履歴から拾い直す基準にする。
-    let cursors = Cursors::default();
-    let eew_queue = EewQueue::default();
-    spawn_eew_worker(config.clone(), http.clone(), eew_queue.clone());
-    let other_tx = spawn_worker(config.clone(), http.clone(), cursors.clone());
+    // 通知先ごとに待ち行列・投稿状態・再送基準を分離し、接続だけを共有する。
+    let destinations: Vec<Destination> = config
+        .webhooks
+        .iter()
+        .cloned()
+        .map(|hook| Destination::spawn(hook, &http))
+        .collect();
 
     // 切断されても再接続し続ける。
     let mut backoff = BACKOFF_MIN;
     loop {
         let started = Instant::now();
-        let result = run_once(&config, &http, &eew_queue, &other_tx, &cursors).await;
+        let result = run_once(&config.ws_url, &http, &destinations).await;
         let rate_limited = match &result {
             Ok(()) => {
                 warn!("WebSocket 接続が終了しました。再接続します");
@@ -319,9 +326,49 @@ async fn main() -> Result<()> {
         } else {
             backoff
         };
-        info!(wait_ms = wait.as_millis() as u64, rate_limited, "再接続まで待機します");
+        info!(
+            wait_ms = wait.as_millis() as u64,
+            rate_limited, "再接続まで待機します"
+        );
         tokio::time::sleep(wait).await;
         backoff = next_backoff(backoff);
+    }
+}
+
+/// 接続を共有する送信先。状態は再接続をまたいで保持する。
+struct Destination {
+    config: WebhookConfig,
+    eew_queue: EewQueue,
+    other_tx: mpsc::Sender<Job>,
+    cursors: Cursors,
+}
+
+impl Destination {
+    fn spawn(config: WebhookConfig, http: &reqwest::Client) -> Self {
+        let cursors = Cursors::default();
+        let eew_queue = EewQueue::default();
+        spawn_eew_worker(config.clone(), http.clone(), eew_queue.clone());
+        let other_tx = spawn_worker(config.clone(), http.clone(), cursors.clone());
+        Self {
+            config,
+            eew_queue,
+            other_tx,
+            cursors,
+        }
+    }
+}
+
+/// 同じ受信内容を、送信先ごとの条件で独立した待ち行列へ振り分ける。
+fn dispatch_all(text: &str, destinations: &[Destination]) {
+    for destination in destinations {
+        let _span = tracing::info_span!("webhook", name = %destination.config.name).entered();
+        dispatch(
+            text,
+            &destination.eew_queue,
+            &destination.other_tx,
+            &destination.cursors,
+            &destination.config,
+        );
     }
 }
 
@@ -342,33 +389,41 @@ fn is_rate_limited(error: &anyhow::Error) -> bool {
 /// 受信テキストを1件ずつ処理するワーカーを起動し、その送信口を返す。
 ///
 /// 通知処理（地図生成・Discord 送信）は受信ループではなくこちらで行う。
-fn spawn_worker(config: Config, http: reqwest::Client, cursors: Cursors) -> mpsc::Sender<Job> {
+fn spawn_worker(
+    config: WebhookConfig,
+    http: reqwest::Client,
+    cursors: Cursors,
+) -> mpsc::Sender<Job> {
     let (tx, mut rx) = mpsc::channel::<Job>(WORKER_QUEUE_CAPACITY);
-    tokio::spawn(async move {
-        // 重複報・再送を抑制する状態。再接続をまたいで保持する。
-        let mut dedup = DedupState::default();
-        while let Some(job) = rx.recv().await {
-            let msg = match job {
-                Job::Message(msg) => msg,
-                Job::Barrier(done) => {
-                    // 送り主はここまでの処理が終わるのを待っている。
-                    let _ = done.send(());
-                    continue;
-                }
-            };
-            match handle_text(&config, &http, &msg.text, false, &mut dedup).await {
-                // 通知まで終えたものだけ基準を進める。待ち行列に入れた時点で進めると、
-                // Discord 送信に失敗した報が拾い直しの対象から外れて永久に失われる。
-                Ok(()) => cursors.record_handled(&msg),
-                Err(e) => {
-                    // 失敗を覚えておき、この報を通知できるまで基準を進めない。
-                    // 拾い直しで再送される。
-                    cursors.record_failed(&msg);
-                    error!(error = %e, code = msg.code, "メッセージ処理に失敗");
+    let span = tracing::info_span!("webhook", name = %config.name);
+    tokio::spawn(
+        async move {
+            // 重複報・再送を抑制する状態。再接続をまたいで保持する。
+            let mut dedup = DedupState::default();
+            while let Some(job) = rx.recv().await {
+                let msg = match job {
+                    Job::Message(msg) => msg,
+                    Job::Barrier(done) => {
+                        // 送り主はここまでの処理が終わるのを待っている。
+                        let _ = done.send(());
+                        continue;
+                    }
+                };
+                match handle_text(&config, &http, &msg.text, false, &mut dedup).await {
+                    // 通知まで終えたものだけ基準を進める。待ち行列に入れた時点で進めると、
+                    // Discord 送信に失敗した報が拾い直しの対象から外れて永久に失われる。
+                    Ok(()) => cursors.record_handled(&msg),
+                    Err(e) => {
+                        // 失敗を覚えておき、この報を通知できるまで基準を進めない。
+                        // 拾い直しで再送される。
+                        cursors.record_failed(&msg);
+                        error!(error = %e, code = msg.code, "メッセージ処理に失敗");
+                    }
                 }
             }
         }
-    });
+        .instrument(span),
+    );
     tx
 }
 
@@ -376,57 +431,61 @@ fn spawn_worker(config: Config, http: reqwest::Client, cursors: Cursors) -> mpsc
 ///
 /// 地震情報(551)とは別のワーカーにして、地図生成の重い 551 に速報が待たされない
 /// ようにする。重複抑制の状態は種別ごとに独立しているため分けても支障はない。
-fn spawn_eew_worker(config: Config, http: reqwest::Client, queue: EewQueue) {
-    tokio::spawn(async move {
-        // 続報の差し替えに使う投稿状態。再接続をまたいで保持する。
-        let mut tracker = EewTracker::default();
-        loop {
-            let pending = queue.pop().await;
-            // 待っている間に古くなった報は投稿しない。
-            let age = pending.received.elapsed();
-            if age > EEW_MAX_AGE {
-                warn!(
-                    event_id = %pending.event_id,
-                    age_secs = age.as_secs(),
-                    "古くなった緊急地震速報を捨てました"
-                );
-                continue;
-            }
-            let result = handle_eew(
-                &config,
-                &http,
-                &pending.message.text,
-                false,
-                &mut tracker,
-                pending.notifiable,
-            )
-            .await;
-            let Err(e) = result else { continue };
+fn spawn_eew_worker(config: WebhookConfig, http: reqwest::Client, queue: EewQueue) {
+    let span = tracing::info_span!("webhook", name = %config.name);
+    tokio::spawn(
+        async move {
+            // 続報の差し替えに使う投稿状態。再接続をまたいで保持する。
+            let mut tracker = EewTracker::default();
+            loop {
+                let pending = queue.pop().await;
+                // 待っている間に古くなった報は投稿しない。
+                let age = pending.received.elapsed();
+                if age > EEW_MAX_AGE {
+                    warn!(
+                        event_id = %pending.event_id,
+                        age_secs = age.as_secs(),
+                        "古くなった緊急地震速報を捨てました"
+                    );
+                    continue;
+                }
+                let result = handle_eew(
+                    &config,
+                    &http,
+                    &pending.message.text,
+                    false,
+                    &mut tracker,
+                    pending.notifiable,
+                )
+                .await;
+                let Err(e) = result else { continue };
 
-            // 履歴から拾い直せない種別なので、鮮度が残っている間は送り直す。
-            // 続報が来ない単発の初報は、ここで捨てると永久に失われる。
-            //
-            // ただし Discord 側で受理済みかもしれない失敗（新規投稿のタイムアウト・
-            // 5xx）では送り直さない。投げ直すと二重投稿になり、しかも記録できる
-            // message_id は後から作られた方だけなので、先の投稿を続報で差し替え
-            // られなくなる。
-            let safe = discord::retry_is_safe(&e);
-            let give_up = !safe || pending.attempts + 1 >= EEW_MAX_ATTEMPTS;
-            error!(
-                error = %e,
-                event_id = %pending.event_id,
-                attempts = pending.attempts + 1,
-                retry_is_safe = safe,
-                give_up,
-                "緊急地震速報の処理に失敗"
-            );
-            if !give_up {
-                queue.retry(pending);
-                // すぐ取り出して叩き直さないよう、少し置いてから次へ進む。
-                tokio::time::sleep(EEW_RETRY_DELAY).await;
+                // 履歴から拾い直せない種別なので、鮮度が残っている間は送り直す。
+                // 続報が来ない単発の初報は、ここで捨てると永久に失われる。
+                //
+                // ただし Discord 側で受理済みかもしれない失敗（新規投稿のタイムアウト・
+                // 5xx）では送り直さない。投げ直すと二重投稿になり、しかも記録できる
+                // message_id は後から作られた方だけなので、先の投稿を続報で差し替え
+                // られなくなる。
+                let safe = discord::retry_is_safe(&e);
+                let give_up = !safe || pending.attempts + 1 >= EEW_MAX_ATTEMPTS;
+                error!(
+                    error = %e,
+                    event_id = %pending.event_id,
+                    attempts = pending.attempts + 1,
+                    retry_is_safe = safe,
+                    give_up,
+                    "緊急地震速報の処理に失敗"
+                );
+                if !give_up {
+                    queue.retry(pending);
+                    // すぐ取り出して叩き直さないよう、少し置いてから次へ進む。
+                    tokio::time::sleep(EEW_RETRY_DELAY).await;
+                }
             }
         }
-    });
+        .instrument(span),
+    );
 }
 
 /// ワーカーへ1件渡す。
@@ -480,16 +539,19 @@ async fn drain(tx: &mpsc::Sender<Job>) -> bool {
 /// サーバは ping への pong を返さない接続を数秒で切るが、pong は読み取りの延長で
 /// 送られるため、ここで時間のかかる処理をすると pong が間に合わず切断される。
 async fn run_once(
-    config: &Config,
+    ws_url: &str,
     http: &reqwest::Client,
-    eew_queue: &EewQueue,
-    other_tx: &mpsc::Sender<Job>,
-    cursors: &Cursors,
+    destinations: &[Destination],
 ) -> Result<()> {
-    let connect = tokio_tungstenite::connect_async(config.ws_url.as_str());
+    let connect = tokio_tungstenite::connect_async(ws_url);
     let (mut ws_stream, _resp) = tokio::time::timeout(CONNECT_TIMEOUT, connect)
         .await
-        .map_err(|_| anyhow!("接続が {} 秒以内に確立しませんでした", CONNECT_TIMEOUT.as_secs()))??;
+        .map_err(|_| {
+            anyhow!(
+                "接続が {} 秒以内に確立しませんでした",
+                CONNECT_TIMEOUT.as_secs()
+            )
+        })??;
     info!("WebSocket に接続しました");
 
     // 購読を始めてから、受信を始める前に取りこぼしを拾う。
@@ -501,7 +563,7 @@ async fn run_once(
     // ここで待っても、接続済みなのでその間の分は取りこぼさない（読み取るまで
     // バッファに残る）。最初の ping は接続から約54秒後なので、数秒の確認で
     // pong が遅れることもない。
-    catch_up_all(http, other_tx, cursors).await;
+    catch_up_all(http, destinations).await;
 
     // 無通信が続く接続は死んでいるとみなす。ネットワークが黙って切れると
     // FIN も RST も届かず、読み取りは永久に待ち続けてしまう。
@@ -525,9 +587,9 @@ async fn run_once(
             _ = retry.tick() => {
                 // 必要なときだけ取りに行く。受信を止めるのは、ライブの報と
                 // 履歴の報が混ざらないようにするため。
-                if cursors.needs_catch_up() {
+                if destinations.iter().any(|d| d.cursors.needs_catch_up()) {
                     info!("通知できていない報または未取得の基準があるため履歴を確認します");
-                    catch_up_all(http, other_tx, cursors).await;
+                    catch_up_all(http, destinations).await;
                 }
                 continue;
             }
@@ -538,7 +600,7 @@ async fn run_once(
             }
         };
         match message {
-            Message::Text(text) => dispatch(&text, eew_queue, other_tx, cursors, config),
+            Message::Text(text) => dispatch_all(&text, destinations),
             Message::Ping(_) | Message::Pong(_) => {}
             Message::Close(_) => {
                 info!("サーバから切断通知を受信");
@@ -644,7 +706,9 @@ impl EewQueue {
                     // それでも収まらない場合の最後の歯止め。鮮度の残る報を
                     // 捨てることになるので、起きたら分かるよう数える。
                     while queue.len() > EEW_QUEUE_CAPACITY {
-                        let Some(dropped) = queue.pop_front() else { break };
+                        let Some(dropped) = queue.pop_front() else {
+                            break;
+                        };
                         let total = self.dropped.fetch_add(1, Ordering::Relaxed) + 1;
                         error!(
                             event_id = %dropped.event_id,
@@ -810,14 +874,13 @@ fn is_catch_up_target(code: i32) -> bool {
 
 /// 受信テキストを code で振り分けてワーカーへ渡す。
 ///
-/// 待ち行列に上限が無いので、ワーカーが詰まっていても捨てず、受信も止めない。
-/// 緊急地震速報は履歴から拾い直せないため、捨てると永久に失われる。
+/// 受信を止めず、緊急地震速報は最新報を保持し、その他は満杯時に履歴から拾い直す。
 fn dispatch(
     text: &str,
     eew_queue: &EewQueue,
     other_tx: &mpsc::Sender<Job>,
     cursors: &Cursors,
-    config: &Config,
+    config: &WebhookConfig,
 ) {
     // 想定外のフォーマットは無視する。
     let Ok(value) = serde_json::from_str::<serde_json::Value>(text) else {
@@ -850,14 +913,19 @@ fn dispatch(
 /// この報が単体で通知条件を満たすか。
 ///
 /// 待ち行列で続報に差し替えられても「条件を満たす報があった」ことを残すために使う。
-fn eew_notifiable(text: &str, config: &Config) -> bool {
+fn eew_notifiable(text: &str, config: &WebhookConfig) -> bool {
     let Ok(eew) = serde_json::from_str::<Eew>(text) else {
         return false;
     };
     if eew.cancelled {
         return false;
     }
-    decide_eew(&eew.areas, &config.region_min_scales, config.other_min_scale).notify
+    decide_eew(
+        &eew.areas,
+        &config.region_min_scales,
+        config.other_min_scale,
+    )
+    .notify
 }
 
 /// 緊急地震速報の eventId。同一地震の続報を束ねる。
@@ -925,49 +993,62 @@ fn plan_catch_up<'a>(
 }
 
 /// 切断中に流れた分を、拾い直す対象すべてについて履歴から回収する。
-async fn catch_up_all(http: &reqwest::Client, tx: &mpsc::Sender<Job>, cursors: &Cursors) {
-    // 待ち行列に残っているライブの報を先に処理させる。残したまま古い履歴の報を
-    // 積むと、新しい内容が古い内容へ差し戻されてしまう。空にできなければ順序を
-    // 崩さないようこの回は見送り、やり残しとして覚えておく（覚えないと、次の
-    // 再接続まで履歴にしか無い報を拾えない）。
-    if !drain(tx).await {
-        for (code, _) in CATCH_UP_TARGETS {
-            cursors.mark_catch_up_pending(code);
+async fn catch_up_all(http: &reqwest::Client, destinations: &[Destination]) {
+    // 全送信先を同時に待ち、待ち時間が送信先数に比例して増えないようにする。
+    // 空にできない送信先だけ見送り、ほかの送信先の履歴確認は続ける。
+    let ready = futures_util::future::join_all(destinations.iter().map(|d| async move {
+        let drained = drain(&d.other_tx).await;
+        if !drained {
+            for (code, _) in CATCH_UP_TARGETS {
+                d.cursors.mark_catch_up_pending(code);
+            }
         }
+        drained
+    }))
+    .await;
+    let ready: Vec<&Destination> = destinations
+        .iter()
+        .zip(ready)
+        .filter_map(|(d, ready)| ready.then_some(d))
+        .collect();
+    if ready.is_empty() {
         return;
     }
+    // 履歴 API も種別ごとに1回だけ取得し、送信先ごとの基準で拾い直す。
     for (code, url) in CATCH_UP_TARGETS {
-        catch_up(http, tx, cursors, code, url).await;
+        catch_up(http, &ready, code, url).await;
     }
 }
 
-/// 切断中に流れた1種別を履歴 API から拾い直してワーカーへ渡す。
-///
-/// 起動直後（基準が無い）は基準を記録するだけで何も通知しない。
-/// そうしないと、起動のたびに過去の地震や津波予報をまとめて投稿してしまう。
-async fn catch_up(
-    http: &reqwest::Client,
-    tx: &mpsc::Sender<Job>,
-    cursors: &Cursors,
-    code: i32,
-    url: &str,
-) {
-    let items = match tokio::time::timeout(CATCH_UP_TIMEOUT, fetch_history(http, url)).await {
+async fn catch_up(http: &reqwest::Client, destinations: &[&Destination], code: i32, url: &str) {
+    let result = tokio::time::timeout(CATCH_UP_TIMEOUT, fetch_history(http, url)).await;
+    let items = match result {
         Ok(Ok(items)) => items,
-        // 取得できなかったことを覚えておく。覚えないと、基準を持っている種別では
-        // 確認し直す理由が無くなり、履歴にしか無い報を次の再接続まで拾えない。
-        Ok(Err(e)) => {
-            warn!(error = %e, code, "取りこぼしの確認に失敗しました");
-            cursors.mark_catch_up_pending(code);
-            return;
-        }
-        Err(_) => {
-            warn!(code, "取りこぼしの確認が時間内に終わりませんでした");
-            cursors.mark_catch_up_pending(code);
+        failure => {
+            match failure {
+                Ok(Err(e)) => warn!(error = %e, code, "取りこぼしの確認に失敗しました"),
+                Err(_) => warn!(code, "取りこぼしの確認が時間内に終わりませんでした"),
+                Ok(Ok(_)) => unreachable!(),
+            }
+            for d in destinations {
+                d.cursors.mark_catch_up_pending(code);
+            }
             return;
         }
     };
+    for d in destinations {
+        let _span = tracing::info_span!("webhook", name = %d.config.name).entered();
+        replay_history(&items, &d.other_tx, &d.cursors, code);
+    }
+}
 
+/// 同じ履歴でも、送信先ごとの成功・失敗の位置に応じて必要な分だけ再送する。
+fn replay_history(
+    items: &[serde_json::Value],
+    tx: &mpsc::Sender<Job>,
+    cursors: &Cursors,
+    code: i32,
+) {
     // 履歴は新しい順に並んでいる。
     let newest = items.first().and_then(message_id).map(str::to_string);
     let previous = cursors.baseline(code);
@@ -976,13 +1057,19 @@ async fn catch_up(
     // ここまで来れば履歴は見られた。
     cursors.clear_catch_up_pending(code);
 
-    let missed = match plan_catch_up(&items, previous) {
+    let missed = match plan_catch_up(items, previous) {
         CatchUp::Rebase => {
             cursors.rebase(code, newest);
             if first_time {
-                info!(code, "起動時の基準を記録しました（起動前の分は通知しません）");
+                info!(
+                    code,
+                    "起動時の基準を記録しました（起動前の分は通知しません）"
+                );
             } else {
-                warn!(code, "基準が履歴に見つからないため拾い直しを諦め、基準を取り直します");
+                warn!(
+                    code,
+                    "基準が履歴に見つからないため拾い直しを諦め、基準を取り直します"
+                );
             }
             return;
         }
@@ -1024,7 +1111,7 @@ const HISTORY_TSUNAMI_URL: &str = "https://api.p2pquake.net/v2/history?codes=552
 
 /// テスト用: 過去の地震情報から通知条件を満たす最新の1件を選び、
 /// 本番と同じ経路 (handle_text) で Discord へ送信して終了する。
-async fn run_test(config: &Config, http: &reqwest::Client) -> Result<()> {
+async fn run_test(config: &WebhookConfig, http: &reqwest::Client) -> Result<()> {
     info!("テストモード: 過去の地震情報を取得します");
     let items = fetch_history(http, HISTORY_URL).await?;
     info!(count = items.len(), "履歴を取得しました");
@@ -1064,7 +1151,7 @@ async fn run_test(config: &Config, http: &reqwest::Client) -> Result<()> {
 ///
 /// 通常の `--test` は最新の通知対象（多くは震源確定済みの詳報）を選ぶため、震源未確定時に
 /// 使う観測県マーカーマップの経路を確認できない。本コマンドはその経路を狙って検証する。
-async fn run_test_prompt(config: &Config, http: &reqwest::Client) -> Result<()> {
+async fn run_test_prompt(config: &WebhookConfig, http: &reqwest::Client) -> Result<()> {
     info!("テストモード: 過去の地震情報から震源未確定の報を取得します");
     let items = fetch_history(http, HISTORY_URL).await?;
     info!(count = items.len(), "履歴を取得しました");
@@ -1108,7 +1195,7 @@ async fn run_test_prompt(config: &Config, http: &reqwest::Client) -> Result<()> 
 
 /// テスト用: 過去の緊急地震速報から通知条件を満たす最新の1件を選び、
 /// 本番と同じ経路 (handle_eew) で Discord へ送信して終了する。
-async fn run_test_eew(config: &Config, http: &reqwest::Client) -> Result<()> {
+async fn run_test_eew(config: &WebhookConfig, http: &reqwest::Client) -> Result<()> {
     info!("テストモード: 過去の緊急地震速報を取得します");
     let items = fetch_history(http, HISTORY_EEW_URL).await?;
     info!(count = items.len(), "履歴を取得しました");
@@ -1124,7 +1211,11 @@ async fn run_test_eew(config: &Config, http: &reqwest::Client) -> Result<()> {
         if eew.cancelled {
             continue;
         }
-        let decision = decide_eew(&eew.areas, &config.region_min_scales, config.other_min_scale);
+        let decision = decide_eew(
+            &eew.areas,
+            &config.region_min_scales,
+            config.other_min_scale,
+        );
         if decision.notify {
             info!(
                 place = %eew.earthquake.hypocenter.name,
@@ -1143,7 +1234,7 @@ async fn run_test_eew(config: &Config, http: &reqwest::Client) -> Result<()> {
 }
 
 /// テスト用: 過去の津波予報から有効な1件を選び、本番経路 (handle_tsunami) で送信して終了する。
-async fn run_test_tsunami(config: &Config, http: &reqwest::Client) -> Result<()> {
+async fn run_test_tsunami(config: &WebhookConfig, http: &reqwest::Client) -> Result<()> {
     info!("テストモード: 過去の津波予報を取得します");
     let items = fetch_history(http, HISTORY_TSUNAMI_URL).await?;
     info!(count = items.len(), "履歴を取得しました");
@@ -1160,7 +1251,10 @@ async fn run_test_tsunami(config: &Config, http: &reqwest::Client) -> Result<()>
             .iter()
             .any(|a| tsunami_grade_rank(&a.grade) > 0);
         if !tsunami.cancelled && has_grade {
-            info!(areas = tsunami.areas.len(), "テスト送信する津波予報を選択しました");
+            info!(
+                areas = tsunami.areas.len(),
+                "テスト送信する津波予報を選択しました"
+            );
             handle_tsunami(config, http, &text, true, &mut seen).await?;
             info!("テスト送信が完了しました");
             return Ok(());
@@ -1175,7 +1269,7 @@ async fn run_test_tsunami(config: &Config, http: &reqwest::Client) -> Result<()>
 ///
 /// `is_test` が true の場合、Discord 通知にテスト送信である旨を明示する。
 async fn handle_text(
-    config: &Config,
+    config: &WebhookConfig,
     http: &reqwest::Client,
     text: &str,
     is_test: bool,
@@ -1205,7 +1299,7 @@ async fn handle_text(
 /// リクエスト全体のタイムアウトを持たないため `MAP_TIMEOUT` で打ち切る。打ち切っても
 /// 走っているタイル取得自体は止められないが、通知はそれを待たずに先へ進める。
 async fn render_map(
-    config: &Config,
+    config: &WebhookConfig,
     hypocenter: Option<(f64, f64)>,
     scale: i32,
     markers: Vec<(f64, f64, i32)>,
@@ -1219,9 +1313,9 @@ async fn render_map(
             mapgen::render_quake_map_with_points(lat, lon, scale, &markers, &tile_tpl)
         }),
         None if markers.is_empty() => return None,
-        None => tokio::task::spawn_blocking(move || {
-            mapgen::render_markers_map(&markers, &tile_tpl)
-        }),
+        None => {
+            tokio::task::spawn_blocking(move || mapgen::render_markers_map(&markers, &tile_tpl))
+        }
     };
 
     match tokio::time::timeout(MAP_TIMEOUT, task).await {
@@ -1249,7 +1343,7 @@ async fn render_map(
 /// 同一地震（発生時刻キー）について速報（震度速報）と詳報（各地の震度など）を別管理し、
 /// 内容が前回と同じなら投稿しない。内容が変わった場合は既存メッセージを差し替える（編集）。
 async fn handle_quake(
-    config: &Config,
+    config: &WebhookConfig,
     http: &reqwest::Client,
     text: &str,
     is_test: bool,
@@ -1275,7 +1369,11 @@ async fn handle_quake(
     }
 
     let is_prompt = quake.issue.is_prompt();
-    let kind = if is_prompt { "震度速報" } else { "地震情報" };
+    let kind = if is_prompt {
+        "震度速報"
+    } else {
+        "地震情報"
+    };
     info!(
         kind,
         max_scale = eq.max_scale,
@@ -1305,7 +1403,10 @@ async fn handle_quake(
     // 発生時刻が不明な場合は重複判定・差し替えができないため、そのまま新規投稿する。
     if key.is_empty() {
         discord::send(http, &config.webhook_url, &payload, image).await?;
-        info!(kind, "Discord へ通知しました（発生時刻不明のため重複判定なし）");
+        info!(
+            kind,
+            "Discord へ通知しました（発生時刻不明のため重複判定なし）"
+        );
         return Ok(());
     }
 
@@ -1349,7 +1450,7 @@ async fn handle_quake(
 /// 第1報で速報し、同一 eventId の続報は同じメッセージを差し替える（551 と同じ方針）。
 /// 取消報は速報済みの場合のみ通知する。
 async fn handle_eew(
-    config: &Config,
+    config: &WebhookConfig,
     http: &reqwest::Client,
     text: &str,
     is_test: bool,
@@ -1376,7 +1477,11 @@ async fn handle_eew(
         return Ok(());
     }
 
-    let decision = decide_eew(&eew.areas, &config.region_min_scales, config.other_min_scale);
+    let decision = decide_eew(
+        &eew.areas,
+        &config.region_min_scales,
+        config.other_min_scale,
+    );
     let posted = tracker.contains(&event_id);
 
     // 未通知のまま基準を下回る報は無視する。通知済みなら、基準を下回った続報でも
@@ -1440,10 +1545,13 @@ async fn handle_eew(
             let message_id =
                 discord::post_message(http, &config.webhook_url, &payload, image).await?;
             info!(event_id = %event_id, message_id = %message_id, "緊急地震速報を通知しました");
-            tracker.insert(&event_id, QuakePost {
-                signature,
-                message_id,
-            });
+            tracker.insert(
+                &event_id,
+                QuakePost {
+                    signature,
+                    message_id,
+                },
+            );
         }
     }
 
@@ -1454,7 +1562,7 @@ async fn handle_eew(
 ///
 /// 同一発表(`id`)の再送は抑制する。発表・解除いずれも通知する。
 async fn handle_tsunami(
-    config: &Config,
+    config: &WebhookConfig,
     http: &reqwest::Client,
     text: &str,
     is_test: bool,
@@ -1551,7 +1659,9 @@ mod tests {
             .status(StatusCode::BAD_GATEWAY)
             .body(None)
             .unwrap();
-        assert!(!is_rate_limited(&anyhow::Error::new(Error::Http(bad_gateway))));
+        assert!(!is_rate_limited(&anyhow::Error::new(Error::Http(
+            bad_gateway
+        ))));
         assert!(!is_rate_limited(&anyhow!("接続が確立しませんでした")));
     }
 
@@ -1585,10 +1695,10 @@ mod tests {
     }
 
     /// 送信先が必ず失敗する設定。しきい値は震度5強。
-    fn test_config() -> Config {
-        Config {
+    fn test_config() -> WebhookConfig {
+        WebhookConfig {
             webhook_url: "http://127.0.0.1:1/failing-webhook".to_string(),
-            ws_url: String::new(),
+            name: "test".to_string(),
             region_min_scales: HashMap::new(),
             other_min_scale: 50,
             attach_map: false,
@@ -1619,6 +1729,264 @@ mod tests {
         }
     }
 
+    /// 外部へ送信せず、Webhook と履歴 API の要求を記録するローカルサーバ。
+    async fn mock_http(history: serde_json::Value) -> (String, mpsc::UnboundedReceiver<String>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let tx = tx.clone();
+                let history = history.clone();
+                tokio::spawn(async move {
+                    let mut bytes = Vec::new();
+                    let mut buffer = [0; 4096];
+                    let header_end = loop {
+                        let n = socket.read(&mut buffer).await.unwrap();
+                        if n == 0 {
+                            return;
+                        }
+                        bytes.extend_from_slice(&buffer[..n]);
+                        if let Some(end) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
+                            break end + 4;
+                        }
+                    };
+                    let headers = String::from_utf8_lossy(&bytes[..header_end]).to_string();
+                    let length = headers
+                        .lines()
+                        .find_map(|line| {
+                            let (key, value) = line.split_once(':')?;
+                            key.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse::<usize>().unwrap())
+                        })
+                        .unwrap_or(0);
+                    while bytes.len() < header_end + length {
+                        let n = socket.read(&mut buffer).await.unwrap();
+                        if n == 0 {
+                            return;
+                        }
+                        bytes.extend_from_slice(&buffer[..n]);
+                    }
+                    let request = headers.lines().next().unwrap().to_string();
+                    let path = request.split_whitespace().nth(1).unwrap();
+                    let name = path
+                        .trim_start_matches('/')
+                        .split(['?', '/'])
+                        .next()
+                        .unwrap();
+                    let body = if name == "history" {
+                        history.to_string()
+                    } else {
+                        serde_json::json!({"id": format!("{name}-id")}).to_string()
+                    };
+                    let status = if name == "failed" {
+                        "400 Bad Request"
+                    } else {
+                        "200 OK"
+                    };
+                    tx.send(request.clone()).unwrap();
+                    if name == "blocked" {
+                        std::future::pending::<()>().await;
+                    }
+                    let response = format!("HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+                    let _ = socket.write_all(response.as_bytes()).await;
+                });
+            }
+        });
+        (format!("http://{addr}"), rx)
+    }
+
+    fn mock_destination(name: &str, url: &str) -> (Destination, mpsc::Receiver<Job>) {
+        let mut config = test_config();
+        config.name = name.to_string();
+        config.webhook_url = url.to_string();
+        let (other_tx, rx) = mpsc::channel(4);
+        (
+            Destination {
+                config,
+                other_tx,
+                eew_queue: EewQueue::default(),
+                cursors: Cursors::default(),
+            },
+            rx,
+        )
+    }
+
+    #[test]
+    fn fanout_keeps_eew_thresholds_and_queue_failures_independent() {
+        let (mut low, mut low_rx) = mock_destination("low", "unused");
+        low.config.region_min_scales.insert("九州".to_string(), 40);
+        let (high, mut high_rx) = mock_destination("high", "unused");
+        let destinations = [low, high];
+        dispatch_all(&eew_text("e1", "event", 40), &destinations);
+        dispatch_all(&eew_text("e2", "event", 30), &destinations);
+        assert!(destinations[0].eew_queue.lock()[0].notifiable);
+        assert!(!destinations[1].eew_queue.lock()[0].notifiable);
+        assert_eq!(
+            destinations[0].eew_queue.lock()[0].message.id.as_deref(),
+            Some("e2")
+        );
+
+        // 片方が満杯でも、もう片方には受信した報が届く。
+        for _ in 0..4 {
+            enqueue(
+                &destinations[0].other_tx,
+                &destinations[0].cursors,
+                incoming(CODE_JMA_QUAKE, "old"),
+            );
+        }
+        dispatch_all(r#"{"code":551,"_id":"q1"}"#, &destinations);
+        assert!(destinations[0].cursors.has_failures());
+        assert!(!destinations[1].cursors.has_failures());
+        assert_eq!(
+            next_message(&mut high_rx).unwrap().id.as_deref(),
+            Some("q1")
+        );
+        assert_eq!(
+            next_message(&mut low_rx).unwrap().id.as_deref(),
+            Some("old")
+        );
+    }
+
+    #[tokio::test]
+    async fn shared_history_is_fetched_once_and_replayed_only_where_needed() {
+        let items = serde_json::json!([{"code":551,"id":"q2"},{"code":551,"id":"q1"}]);
+        let (url, mut requests) = mock_http(items).await;
+        let (first, mut first_rx) = mock_destination("first", "unused");
+        let (second, mut second_rx) = mock_destination("second", "unused");
+        first.cursors.rebase(CODE_JMA_QUAKE, Some("q1".to_string()));
+        first.cursors.record_failed(&incoming(CODE_JMA_QUAKE, "q2"));
+        second
+            .cursors
+            .rebase(CODE_JMA_QUAKE, Some("q2".to_string()));
+        let http = reqwest::Client::builder().no_proxy().build().unwrap();
+        catch_up(
+            &http,
+            &[&first, &second],
+            CODE_JMA_QUAKE,
+            &format!("{url}/history"),
+        )
+        .await;
+        assert_eq!(
+            next_message(&mut first_rx).unwrap().id.as_deref(),
+            Some("q2")
+        );
+        assert!(next_message(&mut second_rx).is_none());
+        assert_eq!(requests.try_recv().unwrap(), "GET /history HTTP/1.1");
+        assert!(requests.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn workers_filter_and_edit_messages_per_webhook() {
+        let (url, mut requests) = mock_http(serde_json::json!([])).await;
+        let http = reqwest::Client::builder().no_proxy().build().unwrap();
+        let mut low = test_config();
+        low.name = "low".to_string();
+        low.webhook_url = format!("{url}/low");
+        low.region_min_scales.insert("関東".to_string(), 40);
+        let mut high = test_config();
+        high.name = "high".to_string();
+        high.webhook_url = format!("{url}/high");
+        let destinations = [
+            Destination::spawn(low, &http),
+            Destination::spawn(high, &http),
+        ];
+        let report = |id, scale| {
+            serde_json::json!({
+                "code": 551, "_id": id, "issue": {"type": "DetailScale"},
+                "earthquake": {"time": "2026/09/06 12:00:00", "maxScale": scale},
+                "points": [{"pref": "東京都", "scale": scale}]
+            })
+            .to_string()
+        };
+        dispatch_all(&report("q1", 40), &destinations);
+        for d in &destinations {
+            assert!(drain(&d.other_tx).await);
+        }
+        assert_eq!(requests.try_recv().unwrap(), "POST /low?wait=true HTTP/1.1");
+        assert!(requests.try_recv().is_err());
+
+        dispatch_all(&report("q2", 50), &destinations);
+        for d in &destinations {
+            assert!(drain(&d.other_tx).await);
+        }
+        let mut calls = vec![requests.try_recv().unwrap(), requests.try_recv().unwrap()];
+        calls.sort();
+        assert_eq!(
+            calls,
+            [
+                "PATCH /low/messages/low-id HTTP/1.1",
+                "POST /high?wait=true HTTP/1.1"
+            ]
+        );
+        // 同一報の再送では、どちらにも重複投稿しない。
+        dispatch_all(&report("q2", 50), &destinations);
+        for d in &destinations {
+            assert!(drain(&d.other_tx).await);
+        }
+        assert!(requests.try_recv().is_err());
+        dispatch_all(&report("q3", 55), &destinations);
+        for d in &destinations {
+            assert!(drain(&d.other_tx).await);
+        }
+        let mut calls = vec![requests.try_recv().unwrap(), requests.try_recv().unwrap()];
+        calls.sort();
+        assert_eq!(
+            calls,
+            [
+                "PATCH /high/messages/high-id HTTP/1.1",
+                "PATCH /low/messages/low-id HTTP/1.1"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn blocked_or_failed_webhooks_do_not_hold_up_other_destinations() {
+        let (url, mut requests) = mock_http(serde_json::json!([])).await;
+        let http = reqwest::Client::builder().no_proxy().build().unwrap();
+        let destinations: Vec<_> = ["blocked", "failed", "healthy"]
+            .iter()
+            .map(|name| {
+                let mut config = test_config();
+                config.name = name.to_string();
+                config.webhook_url = format!("{url}/{name}");
+                Destination::spawn(config, &http)
+            })
+            .collect();
+        let tsunami = r#"{"code":552,"_id":"t1","areas":[{"grade":"Watch","name":"三陸沿岸"}]}"#;
+        dispatch_all(tsunami, &destinations);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            assert!(drain(&destinations[1].other_tx).await);
+            assert!(drain(&destinations[2].other_tx).await);
+        })
+        .await
+        .unwrap();
+        assert!(destinations[1].cursors.has_failures());
+        assert!(!destinations[2].cursors.has_failures());
+        assert_eq!(
+            destinations[2].cursors.lock()[&CODE_TSUNAMI]
+                .handled
+                .as_deref(),
+            Some("t1")
+        );
+        let mut healthy_posts = 0;
+        while let Ok(request) = requests.try_recv() {
+            if request.starts_with("POST /healthy") {
+                healthy_posts += 1;
+            }
+        }
+        assert_eq!(healthy_posts, 1);
+        dispatch_all(tsunami, &destinations);
+        assert!(drain(&destinations[2].other_tx).await);
+        while let Ok(request) = requests.try_recv() {
+            assert!(
+                !request.starts_with("POST /healthy"),
+                "成功済みの送信先には再投稿しない"
+            );
+        }
+    }
+
     #[test]
     fn dispatch_routes_by_code() {
         let eew_queue = EewQueue::default();
@@ -1629,21 +1997,45 @@ mod tests {
 
         let eew = r#"{"code":556,"_id":"e1","issue":{"eventId":"ev1"}}"#;
         dispatch(eew, &eew_queue, &other_tx, &cursors, &config);
-        dispatch(r#"{"code":551,"_id":"q1"}"#, &eew_queue, &other_tx, &cursors, &config);
-        dispatch(r#"{"code":552,"_id":"t1"}"#, &eew_queue, &other_tx, &cursors, &config);
+        dispatch(
+            r#"{"code":551,"_id":"q1"}"#,
+            &eew_queue,
+            &other_tx,
+            &cursors,
+            &config,
+        );
+        dispatch(
+            r#"{"code":552,"_id":"t1"}"#,
+            &eew_queue,
+            &other_tx,
+            &cursors,
+            &config,
+        );
         // 対象外の code、壊れた JSON、eventId の無い緊急地震速報は捨てる。
         dispatch(r#"{"code":555}"#, &eew_queue, &other_tx, &cursors, &config);
         dispatch("not json", &eew_queue, &other_tx, &cursors, &config);
-        dispatch(r#"{"code":556,"_id":"e2"}"#, &eew_queue, &other_tx, &cursors, &config);
+        dispatch(
+            r#"{"code":556,"_id":"e2"}"#,
+            &eew_queue,
+            &other_tx,
+            &cursors,
+            &config,
+        );
 
         // 緊急地震速報は地震情報と別の待ち行列に入り、地図生成に待たされない。
         assert_eq!(eew_queue.lock().len(), 1);
         assert_eq!(eew_queue.lock()[0].event_id, "ev1");
 
         let quake = next_message(&mut other_rx).unwrap();
-        assert_eq!((quake.code, quake.id.as_deref()), (CODE_JMA_QUAKE, Some("q1")));
+        assert_eq!(
+            (quake.code, quake.id.as_deref()),
+            (CODE_JMA_QUAKE, Some("q1"))
+        );
         let tsunami = next_message(&mut other_rx).unwrap();
-        assert_eq!((tsunami.code, tsunami.id.as_deref()), (CODE_TSUNAMI, Some("t1")));
+        assert_eq!(
+            (tsunami.code, tsunami.id.as_deref()),
+            (CODE_TSUNAMI, Some("t1"))
+        );
         assert!(next_message(&mut other_rx).is_none());
     }
 
@@ -1676,7 +2068,10 @@ mod tests {
         // 緊急地震速報は拾い直しの対象外なので基準を持たない。
         cursors.record_handled(&incoming(CODE_EEW, "e1"));
 
-        assert_eq!(cursors.baseline(CODE_JMA_QUAKE), Some(Some("q1".to_string())));
+        assert_eq!(
+            cursors.baseline(CODE_JMA_QUAKE),
+            Some(Some("q1".to_string()))
+        );
         assert_eq!(cursors.baseline(CODE_TSUNAMI), Some(Some("t1".to_string())));
         assert_eq!(cursors.baseline(CODE_EEW), None);
     }
@@ -1713,14 +2108,30 @@ mod tests {
 
         let config = test_config();
         for serial in 1..=50 {
-            dispatch(&eew_text(&format!("e{serial}"), "ev1", 50), &queue, &other_tx, &cursors, &config);
+            dispatch(
+                &eew_text(&format!("e{serial}"), "ev1", 50),
+                &queue,
+                &other_tx,
+                &cursors,
+                &config,
+            );
         }
         // 別の地震は別の枠になる。
-        dispatch(&eew_text("x1", "ev2", 50), &queue, &other_tx, &cursors, &config);
+        dispatch(
+            &eew_text("x1", "ev2", 50),
+            &queue,
+            &other_tx,
+            &cursors,
+            &config,
+        );
 
         assert_eq!(queue.lock().len(), 2, "地震ごとに1件だけ持つ");
         assert_eq!(queue.lock()[0].event_id, "ev1");
-        assert_eq!(queue.lock()[0].message.id.as_deref(), Some("e50"), "最新の報が残る");
+        assert_eq!(
+            queue.lock()[0].message.id.as_deref(),
+            Some("e50"),
+            "最新の報が残る"
+        );
     }
 
     #[test]
@@ -1732,13 +2143,29 @@ mod tests {
         let cursors = Cursors::default();
         let config = test_config();
 
-        dispatch(&eew_text("e1", "ev1", 50), &queue, &other_tx, &cursors, &config);
+        dispatch(
+            &eew_text("e1", "ev1", 50),
+            &queue,
+            &other_tx,
+            &cursors,
+            &config,
+        );
         assert!(queue.lock()[0].notifiable, "初報は条件を満たす");
 
-        dispatch(&eew_text("e2", "ev1", 40), &queue, &other_tx, &cursors, &config);
+        dispatch(
+            &eew_text("e2", "ev1", 40),
+            &queue,
+            &other_tx,
+            &cursors,
+            &config,
+        );
         let queued = queue.lock();
         assert_eq!(queued.len(), 1);
-        assert_eq!(queued[0].message.id.as_deref(), Some("e2"), "内容は最新の報");
+        assert_eq!(
+            queued[0].message.id.as_deref(),
+            Some("e2"),
+            "内容は最新の報"
+        );
         assert!(queued[0].notifiable, "条件を満たした事実は残る");
     }
 
@@ -1769,7 +2196,11 @@ mod tests {
         queue.retry(failed);
         let queued = queue.lock();
         assert_eq!(queued.len(), 1);
-        assert_eq!(queued[0].message.id.as_deref(), Some("new"), "新しい報を優先");
+        assert_eq!(
+            queued[0].message.id.as_deref(),
+            Some("new"),
+            "新しい報を優先"
+        );
         assert!(queued[0].notifiable, "条件を満たした事実は引き継ぐ");
     }
 
@@ -1780,7 +2211,11 @@ mod tests {
         for event in 0..(EEW_QUEUE_CAPACITY + 10) {
             queue.push(format!("ev{event}"), true, incoming(CODE_EEW, "e"));
         }
-        assert_eq!(queue.dropped.load(Ordering::Relaxed), 10, "捨てた数を数える");
+        assert_eq!(
+            queue.dropped.load(Ordering::Relaxed),
+            10,
+            "捨てた数を数える"
+        );
         assert_eq!(queue.lock().len(), EEW_QUEUE_CAPACITY);
         // 捨てられるのは最も古い＝最も価値の低い報。
         assert_eq!(queue.lock()[0].event_id, "ev10");
@@ -2008,14 +2443,20 @@ mod tests {
 
         // 拾い直す種別には履歴 API の URL が対応している。
         for (code, url) in CATCH_UP_TARGETS {
-            assert!(url.contains(&format!("codes={code}")), "{code} の URL: {url}");
+            assert!(
+                url.contains(&format!("codes={code}")),
+                "{code} の URL: {url}"
+            );
         }
     }
 
     #[test]
     fn message_id_reads_both_key_names() {
         assert_eq!(message_id(&serde_json::json!({ "_id": "ws" })), Some("ws"));
-        assert_eq!(message_id(&serde_json::json!({ "id": "rest" })), Some("rest"));
+        assert_eq!(
+            message_id(&serde_json::json!({ "id": "rest" })),
+            Some("rest")
+        );
         assert_eq!(message_id(&serde_json::json!({})), None);
     }
 
@@ -2073,10 +2514,13 @@ mod tests {
         // 続報で差し替えられるよう、eventId から message_id を引けること。
         let mut tracker = EewTracker::default();
         assert!(tracker.posted("ev1").is_none());
-        tracker.insert("ev1", QuakePost {
-            signature: 1,
-            message_id: "m1".to_string(),
-        });
+        tracker.insert(
+            "ev1",
+            QuakePost {
+                signature: 1,
+                message_id: "m1".to_string(),
+            },
+        );
         assert!(tracker.contains("ev1"));
         assert_eq!(tracker.posted("ev1"), Some(("m1".to_string(), 1)));
 
@@ -2089,10 +2533,13 @@ mod tests {
     fn eew_tracker_evicts_oldest_over_capacity() {
         let mut tracker = EewTracker::default();
         for i in 0..(SEEN_ID_CAPACITY + 5) {
-            tracker.insert(&format!("ev-{i}"), QuakePost {
-                signature: 0,
-                message_id: String::new(),
-            });
+            tracker.insert(
+                &format!("ev-{i}"),
+                QuakePost {
+                    signature: 0,
+                    message_id: String::new(),
+                },
+            );
         }
         assert_eq!(tracker.map.len(), SEEN_ID_CAPACITY);
         assert!(!tracker.contains("ev-0"));
