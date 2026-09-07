@@ -1,8 +1,9 @@
 //! 共通の接続設定と、独立した通知設定ファイルの読み込み。
 
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 
-use anyhow::{ensure, Context, Result};
+use anyhow::{anyhow, ensure, Context, Result};
 
 use crate::intensity::REGIONS;
 
@@ -36,6 +37,14 @@ impl Config {
         get: impl Fn(&str) -> Option<String>,
         read: impl Fn(&str) -> Result<HashMap<String, String>>,
     ) -> Result<Self> {
+        Self::from_sources_with_resolver(get, read, canonicalize_notification_path)
+    }
+
+    fn from_sources_with_resolver(
+        get: impl Fn(&str) -> Option<String>,
+        read: impl Fn(&str) -> Result<HashMap<String, String>>,
+        resolve: impl Fn(&str) -> Result<PathBuf>,
+    ) -> Result<Self> {
         let ws_url =
             get("P2PQUAKE_WS_URL").unwrap_or_else(|| "wss://api.p2pquake.net/v2/ws".to_string());
         let webhooks = if let Some(paths) = get("NOTIFICATION_CONFIG_FILES") {
@@ -46,8 +55,10 @@ impl Config {
                     !path.is_empty(),
                     "NOTIFICATION_CONFIG_FILES に空のファイル名があります"
                 );
+                let canonical_path = resolve(path)
+                    .with_context(|| format!("通知設定ファイル {path} のパスを解決できません"))?;
                 ensure!(
-                    seen.insert(path),
+                    seen.insert(canonical_path),
                     "通知設定ファイルが重複しています: {path}"
                 );
                 let values = read(path)
@@ -66,15 +77,36 @@ impl Config {
     }
 }
 
+fn canonicalize_notification_path(path: &str) -> Result<PathBuf> {
+    std::fs::canonicalize(path).with_context(|| format!("通知設定ファイル {path} が存在しません"))
+}
+
 fn read_notification_file(path: &str) -> Result<HashMap<String, String>> {
     // dotenv() と違い、プロセスの環境変数を上書きしない。
-    let entries = dotenvy::from_path_iter(path)?;
+    let entries =
+        dotenvy::from_path_iter(path).map_err(|error| sanitize_dotenv_error(path, error))?;
     let mut values = HashMap::new();
     for entry in entries {
-        let (key, value) = entry?;
+        let (key, value) = entry.map_err(|error| sanitize_dotenv_error(path, error))?;
         values.insert(key, value);
     }
     Ok(values)
+}
+
+fn sanitize_dotenv_error(path: &str, error: dotenvy::Error) -> anyhow::Error {
+    match error {
+        // dotenvy の LineParse は秘密値を含む行全体を保持しているため、表示しない。
+        dotenvy::Error::LineParse(_, line) => {
+            anyhow!("通知設定ファイル {path} の構文エラー（行番号: {line}）")
+        }
+        dotenvy::Error::Io(error) => {
+            anyhow!("通知設定ファイル {path} の読み込みに失敗しました: {error}")
+        }
+        dotenvy::Error::EnvVar(error) => {
+            anyhow!("通知設定ファイル {path} の環境変数展開に失敗しました: {error}")
+        }
+        _ => anyhow!("通知設定ファイル {path} の読み込みに失敗しました"),
+    }
 }
 
 impl WebhookConfig {
@@ -117,6 +149,7 @@ impl WebhookConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::{Component, Path};
 
     fn lookup(values: &[(&str, &str)], key: &str) -> Option<String> {
         values
@@ -126,7 +159,7 @@ mod tests {
     }
 
     fn config(env: &[(&str, &str)], files: &[(&str, &[(&str, &str)])]) -> Result<Config> {
-        Config::from_sources(
+        Config::from_sources_with_resolver(
             |key| lookup(env, key),
             |path| {
                 let (_, values) = files
@@ -137,6 +170,19 @@ mod tests {
                     .iter()
                     .map(|(k, v)| (k.to_string(), v.to_string()))
                     .collect())
+            },
+            |path| {
+                let mut normalized = PathBuf::new();
+                for component in Path::new(path).components() {
+                    match component {
+                        Component::CurDir => {}
+                        Component::ParentDir => {
+                            normalized.pop();
+                        }
+                        component => normalized.push(component.as_os_str()),
+                    }
+                }
+                Ok(normalized)
             },
         )
     }
@@ -292,5 +338,44 @@ mod tests {
         assert_eq!(hook.other_min_scale, 40);
         assert_eq!(hook.region_min_scales["関東"], 30);
         assert!(!hook.attach_map);
+    }
+
+    #[test]
+    fn canonical_path_aliases_are_rejected_as_duplicates() {
+        let root =
+            std::env::temp_dir().join(format!("quake-alert-config-alias-{}", std::process::id()));
+        let nested = root.join("nested");
+        let file = root.join("foo.env");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(&file, "DISCORD_WEBHOOK_URL=https://example.com/hook\n").unwrap();
+        let paths = format!("{},{}", file.display(), nested.join("../foo.env").display());
+        let error = Config::from_sources(
+            |key| (key == "NOTIFICATION_CONFIG_FILES").then_some(paths.clone()),
+            read_notification_file,
+        )
+        .unwrap_err();
+        std::fs::remove_dir_all(&root).unwrap();
+        assert!(error.to_string().contains("重複しています"));
+    }
+
+    #[test]
+    fn dotenv_syntax_errors_do_not_include_secret_values() {
+        let path = std::env::temp_dir().join(format!(
+            "quake-alert-config-secret-{}.env",
+            std::process::id()
+        ));
+        let secret = "https://discord.com/api/webhooks/private-secret";
+        std::fs::write(
+            &path,
+            format!("DISCORD_WEBHOOK_URL=\"{secret}\nOTHER_MIN_SCALE=40\n"),
+        )
+        .unwrap();
+        let error = read_notification_file(path.to_str().unwrap()).unwrap_err();
+        std::fs::remove_file(&path).unwrap();
+        let message = format!("{error:#}");
+        assert!(message.contains("構文エラー"));
+        assert!(message.contains("行番号"));
+        assert!(message.contains(path.to_str().unwrap()));
+        assert!(!message.contains(secret));
     }
 }
