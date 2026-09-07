@@ -82,9 +82,12 @@ fn canonicalize_notification_path(path: &str) -> Result<PathBuf> {
 }
 
 fn read_notification_file(path: &str) -> Result<HashMap<String, String>> {
-    // dotenv() と違い、プロセスの環境変数を上書きしない。
-    let entries =
-        dotenvy::from_path_iter(path).map_err(|error| sanitize_dotenv_error(path, error))?;
+    // dotenvy の変数展開はプロセス環境を参照するため、先に `$` をエスケープする。
+    // 通知設定ファイルはファイル内の値だけで完結させ、起動用環境変数を継承しない。
+    let contents = std::fs::read_to_string(path)
+        .with_context(|| format!("通知設定ファイル {path} を読み込めません"))?;
+    let contents = escape_dollar_expansion(&contents);
+    let entries = dotenvy::from_read_iter(std::io::Cursor::new(contents));
     let mut values = HashMap::new();
     for entry in entries {
         let (key, value) = entry.map_err(|error| sanitize_dotenv_error(path, error))?;
@@ -93,11 +96,62 @@ fn read_notification_file(path: &str) -> Result<HashMap<String, String>> {
     Ok(values)
 }
 
+/// dotenvy の構文を維持したまま、変数展開の記号だけをリテラルにする。
+fn escape_dollar_expansion(contents: &str) -> String {
+    let mut escaped = String::with_capacity(contents.len());
+    let mut single_quote = false;
+    let mut double_quote = false;
+    let mut backslash = false;
+
+    for character in contents.chars() {
+        if single_quote {
+            escaped.push(character);
+            if character == '\'' {
+                single_quote = false;
+            }
+            continue;
+        }
+        if backslash {
+            escaped.push(character);
+            backslash = false;
+            continue;
+        }
+        if character == '\\' {
+            escaped.push(character);
+            backslash = true;
+        } else {
+            if double_quote {
+                if character == '"' {
+                    escaped.push(character);
+                    double_quote = false;
+                } else if character == '$' {
+                    escaped.push('\\');
+                    escaped.push('$');
+                } else {
+                    escaped.push(character);
+                }
+            } else if character == '\'' {
+                escaped.push(character);
+                single_quote = true;
+            } else if character == '"' {
+                escaped.push(character);
+                double_quote = true;
+            } else if character == '$' {
+                escaped.push('\\');
+                escaped.push('$');
+            } else {
+                escaped.push(character);
+            }
+        }
+    }
+    escaped
+}
+
 fn sanitize_dotenv_error(path: &str, error: dotenvy::Error) -> anyhow::Error {
     match error {
         // dotenvy の LineParse は秘密値を含む行全体を保持しているため、表示しない。
-        dotenvy::Error::LineParse(_, line) => {
-            anyhow!("通知設定ファイル {path} の構文エラー（行番号: {line}）")
+        dotenvy::Error::LineParse(_, position) => {
+            anyhow!("通知設定ファイル {path} の構文エラー（行内位置: {position}）")
         }
         dotenvy::Error::Io(error) => {
             anyhow!("通知設定ファイル {path} の読み込みに失敗しました: {error}")
@@ -374,8 +428,20 @@ mod tests {
         std::fs::remove_file(&path).unwrap();
         let message = format!("{error:#}");
         assert!(message.contains("構文エラー"));
-        assert!(message.contains("行番号"));
+        assert!(message.contains("行内位置"));
         assert!(message.contains(path.to_str().unwrap()));
         assert!(!message.contains(secret));
+    }
+
+    #[test]
+    fn dotenv_values_do_not_expand_process_environment() {
+        let path = std::env::temp_dir().join(format!(
+            "quake-alert-config-expansion-{}.env",
+            std::process::id()
+        ));
+        std::fs::write(&path, "DISCORD_WEBHOOK_URL=$HOME\n").unwrap();
+        let values = read_notification_file(path.to_str().unwrap()).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(values["DISCORD_WEBHOOK_URL"], "$HOME");
     }
 }
