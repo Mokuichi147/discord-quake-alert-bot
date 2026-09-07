@@ -102,8 +102,38 @@ fn escape_dollar_expansion(contents: &str) -> String {
     let mut single_quote = false;
     let mut double_quote = false;
     let mut backslash = false;
+    let mut expecting_end = false;
+    let mut line_start = true;
+    let mut only_whitespace = true;
+    let mut comment = false;
 
     for character in contents.chars() {
+        if comment {
+            escaped.push(character);
+            if character == '\n' {
+                comment = false;
+                line_start = true;
+                only_whitespace = true;
+                expecting_end = false;
+            }
+            continue;
+        }
+
+        if line_start && !single_quote && !double_quote {
+            if only_whitespace && matches!(character, ' ' | '\t' | '\r') {
+                escaped.push(character);
+                continue;
+            }
+            if only_whitespace && character == '#' {
+                escaped.push(character);
+                comment = true;
+                line_start = false;
+                continue;
+            }
+            line_start = false;
+            only_whitespace = false;
+        }
+
         if single_quote {
             escaped.push(character);
             if character == '\'' {
@@ -116,32 +146,64 @@ fn escape_dollar_expansion(contents: &str) -> String {
             backslash = false;
             continue;
         }
-        if character == '\\' {
-            escaped.push(character);
-            backslash = true;
-        } else {
-            if double_quote {
-                if character == '"' {
-                    escaped.push(character);
-                    double_quote = false;
-                } else if character == '$' {
-                    escaped.push('\\');
-                    escaped.push('$');
-                } else {
-                    escaped.push(character);
-                }
-            } else if character == '\'' {
+        if double_quote {
+            if character == '\\' {
                 escaped.push(character);
-                single_quote = true;
+                backslash = true;
             } else if character == '"' {
                 escaped.push(character);
-                double_quote = true;
+                double_quote = false;
             } else if character == '$' {
                 escaped.push('\\');
                 escaped.push('$');
             } else {
                 escaped.push(character);
             }
+            continue;
+        }
+
+        if expecting_end {
+            if matches!(character, ' ' | '\t') {
+                escaped.push(character);
+                continue;
+            }
+            if character == '#' {
+                escaped.push(character);
+                comment = true;
+                expecting_end = false;
+                continue;
+            }
+            expecting_end = false;
+        }
+
+        match character {
+            '\\' => {
+                escaped.push(character);
+                backslash = true;
+            }
+            '\'' => {
+                escaped.push(character);
+                single_quote = true;
+            }
+            '"' => {
+                escaped.push(character);
+                double_quote = true;
+            }
+            '$' => {
+                escaped.push('\\');
+                escaped.push('$');
+            }
+            ' ' | '\t' => {
+                escaped.push(character);
+                expecting_end = true;
+            }
+            '\n' => {
+                escaped.push(character);
+                line_start = true;
+                only_whitespace = true;
+                expecting_end = false;
+            }
+            _ => escaped.push(character),
         }
     }
     escaped
@@ -439,9 +501,14 @@ mod tests {
             "quake-alert-config-expansion-{}.env",
             std::process::id()
         ));
-        std::fs::write(&path, "DISCORD_WEBHOOK_URL=$HOME\n").unwrap();
+        std::fs::write(
+            &path,
+            "# don't expand variables\nDISCORD_WEBHOOK_URL=$HOME\n# a \"comment\"\nTILE_URL_TEMPLATE='$HOME'\n",
+        )
+        .unwrap();
         let values = read_notification_file(path.to_str().unwrap()).unwrap();
         std::fs::remove_file(&path).unwrap();
         assert_eq!(values["DISCORD_WEBHOOK_URL"], "$HOME");
+        assert_eq!(values["TILE_URL_TEMPLATE"], "$HOME");
     }
 }
