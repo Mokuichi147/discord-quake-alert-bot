@@ -1,3 +1,8 @@
 /target
 .env
 *.png
+
+# Webhook URL を含む個別の通知設定（雛形は追跡する）
+.env.*
+!.env.example
+!.env.*.example
