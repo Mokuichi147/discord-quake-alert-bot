@@ -51,8 +51,14 @@ pub const REGIONS: &[(&str, &str, &[&str])] = &[
 ];
 
 /// 都道府県名を正規化する。末尾の「都/府/県」を除く（「道」は残す）。
-/// 例: "東京都"→"東京", "大阪府"→"大阪", "北海道"→"北海道", "東京"→"東京"。
+/// 北海道の予報区名（「北海道道北」など）は親都道府県へ畳み込む。
+/// 例: "東京都"→"東京", "大阪府"→"大阪", "北海道道北"→"北海道"。
 pub fn normalize_pref(pref: &str) -> &str {
+    if let Some(area) = pref.strip_prefix("北海道") {
+        if area.starts_with('道') {
+            return "北海道";
+        }
+    }
     pref.strip_suffix('都')
         .or_else(|| pref.strip_suffix('府'))
         .or_else(|| pref.strip_suffix('県'))
@@ -414,8 +420,10 @@ mod tests {
         assert_eq!(normalize_pref("東京都"), "東京");
         assert_eq!(normalize_pref("大阪府"), "大阪");
         assert_eq!(normalize_pref("北海道"), "北海道");
+        assert_eq!(normalize_pref("北海道道北"), "北海道");
         assert_eq!(normalize_pref("東京"), "東京");
         assert_eq!(region_of("東京都"), Some("関東"));
+        assert_eq!(region_of("北海道道北"), Some("北海道"));
         assert_eq!(region_of("宮城"), Some("東北"));
         assert_eq!(region_of("大阪府"), Some("近畿"));
         assert_eq!(region_of("ハワイ"), None);

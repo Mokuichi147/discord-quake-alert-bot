@@ -146,11 +146,9 @@ pub fn search_observation_stations(
                 0.70 + 0.30 * query.chars().count() as f64 / name.chars().count() as f64
             } else if query == pref {
                 0.65
-            } else if let Some(combined) = combined_forms.iter().find(|form| form.contains(&query))
-            {
-                0.50 + 0.15 * query.chars().count() as f64 / combined.chars().count() as f64
             } else {
-                return None;
+                let combined = combined_forms.iter().find(|form| form.contains(&query))?;
+                0.50 + 0.15 * query.chars().count() as f64 / combined.chars().count() as f64
             };
             Some(ObservationStationMatch { score, station })
         })

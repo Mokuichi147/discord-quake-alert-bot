@@ -784,6 +784,27 @@ mod tests {
     }
 
     #[test]
+    fn watched_eew_matches_hokkaido_forecast_prefecture() {
+        let eew: Eew = serde_json::from_value(json!({
+            "code":556,"areas":[
+                {"pref":"北海道道北","name":"北海道道北","scaleFrom":40,"scaleTo":50}
+            ]
+        }))
+        .unwrap();
+        let watched = vec![watched("北海道", "北海道道北", "登録地点")];
+        let mut payload = build_eew_payload(&eew, "", false, false);
+
+        highlight_watched_eew(&mut payload, &eew, &watched);
+
+        let field = &payload["embeds"][0]["fields"][0];
+        assert_eq!(field["name"], "📍 登録地点の予想震度");
+        assert_eq!(
+            field["value"],
+            "**登録地点（北海道・北海道道北）：震度4〜5強**"
+        );
+    }
+
+    #[test]
     fn many_watched_points_fit_field_limit() {
         let mut payload = json!({"embeds":[{"fields":[]}]});
         let lines = (0..100)
