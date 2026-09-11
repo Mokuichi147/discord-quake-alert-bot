@@ -2,48 +2,172 @@
 //!
 //! P2P地震情報の `points` には座標が含まれないため、地図を描くには地点名から
 //! 座標を引く必要がある。`addr`（観測点名。例: "八戸市湊町"）が
-//! `data/observation_points.tsv` の座標テーブルに一致すれば、その市区町村・観測点の
-//! 正確な座標にプロットする（詳報 `DetailScale` はこの粒度）。一致しない地点
-//! （震度速報の地域名や、気象庁以外が運用する観測点など）は都道府県の代表座標へ
+//! `data/observation_stations.tsv` の都道府県・観測点名に一致すれば、
+//! 公開データの座標にプロットする（詳報 `DetailScale` はこの粒度）。
+//! 一致しない地点（震度速報の地域名や未収録の観測点など）は都道府県の代表座標へ
 //! フォールバックする。
 
 use std::collections::HashMap;
 use std::sync::OnceLock;
 
-use crate::intensity::{display_pref, eew_area_scale};
+use anyhow::{ensure, Result};
+
+use crate::intensity::{display_pref, eew_area_scale, normalize_pref};
 use crate::model::{EewArea, Point};
 
-/// 観測点名 → (緯度, 経度) の座標データ（タブ区切り: 名前\t緯度\t経度）。
-///
-/// 気象庁公式サイトの「[気象庁震度観測点一覧表](https://www.data.jma.go.jp/eqev/data/kyoshin/jma-shindo.html)」
-/// （現用の観測点のみ、CC BY 4.0）から抽出した気象庁自身の観測点データ。
-/// 都道府県・市区町村や防災科学技術研究所(NIED)が独自に運用する観測点は、
-/// それぞれ利用規約が異なる（NIEDは再配布を禁止している）ため含めていない。
-/// そのため `points.addr` がこのテーブルに一致するのは気象庁自身の観測点のみで、
-/// 一致しない地点は都道府県代表座標にフォールバックする。
-/// 観測点の統廃合により将来的にズレが生じる可能性がある。
-const OBSERVATION_POINTS_TSV: &str = include_str!("data/observation_points.tsv");
+/// 気象庁公開の観測点マップから生成した都道府県・観測点名・緯度・経度のTSV。
+/// 気象庁・地方公共団体・防災科学技術研究所の観測点を含む。
+/// 出典・精度・更新手順は data/README.md を参照。
+const OBSERVATION_STATIONS_TSV: &str = include_str!("data/observation_stations.tsv");
 
-/// 観測点名 → 座標のルックアップテーブルを初回アクセス時にパースして返す。
-fn observation_points() -> &'static HashMap<&'static str, (f64, f64)> {
-    static CACHE: OnceLock<HashMap<&'static str, (f64, f64)>> = OnceLock::new();
+/// 組み込み観測点の検索・表示に使う1地点。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ObservationStation {
+    pub pref: &'static str,
+    pub name: &'static str,
+    pub latitude: f64,
+    pub longitude: f64,
+}
+
+type StationCoords = HashMap<(&'static str, &'static str), (f64, f64)>;
+
+/// 組み込み観測点TSVをパースした一覧。
+pub fn observation_stations() -> &'static [ObservationStation] {
+    static CACHE: OnceLock<Vec<ObservationStation>> = OnceLock::new();
     CACHE.get_or_init(|| {
-        OBSERVATION_POINTS_TSV
+        OBSERVATION_STATIONS_TSV
             .lines()
-            .filter_map(|line| {
-                let mut cols = line.split('\t');
-                let name = cols.next()?;
-                let lat: f64 = cols.next()?.parse().ok()?;
-                let lon: f64 = cols.next()?.parse().ok()?;
-                Some((name, (lat, lon)))
+            .filter(|line| !line.starts_with('#'))
+            .map(|line| {
+                let cols: Vec<_> = line.split('\t').collect();
+                assert_eq!(cols.len(), 4, "組み込み観測点TSVの列数が不正です");
+                ObservationStation {
+                    pref: cols[0],
+                    name: cols[1],
+                    latitude: cols[2].parse().expect("観測点の緯度が不正です"),
+                    longitude: cols[3].parse().expect("観測点の経度が不正です"),
+                }
             })
             .collect()
     })
 }
 
-/// 観測点名（`points.addr`）から正確な座標 (緯度, 経度) を引く。未収録の地点は None。
-pub fn observation_point_coord(addr: &str) -> Option<(f64, f64)> {
-    observation_points().get(addr).copied()
+/// 都道府県と観測点名の組み合わせで照合し、別の県の同名地点を混同しない。
+fn station_coords() -> &'static StationCoords {
+    static CACHE: OnceLock<StationCoords> = OnceLock::new();
+    CACHE.get_or_init(|| {
+        observation_stations()
+            .iter()
+            .map(|station| {
+                (
+                    (normalize_pref(station.pref), station.name),
+                    (station.latitude, station.longitude),
+                )
+            })
+            .collect()
+    })
+}
+
+/// 都道府県・観測点名から公開データの座標を引く。未収録の地点は None。
+pub fn observation_point_coord(pref: &str, addr: &str) -> Option<(f64, f64)> {
+    station_coords().get(&(normalize_pref(pref), addr)).copied()
+}
+
+/// 検索用に全角英数字・空白・区切り記号の違いを吸収する。
+fn normalize_search_text(value: &str) -> String {
+    let mut normalized = String::new();
+    for character in value.chars() {
+        let character = match character {
+            'Ａ'..='Ｚ' => char::from_u32(character as u32 - 'Ａ' as u32 + 'A' as u32)
+                .expect("全角英字の変換に失敗しました"),
+            'ａ'..='ｚ' => char::from_u32(character as u32 - 'ａ' as u32 + 'a' as u32)
+                .expect("全角英字の変換に失敗しました"),
+            '０'..='９' => char::from_u32(character as u32 - '０' as u32 + '0' as u32)
+                .expect("全角数字の変換に失敗しました"),
+            '　' => ' ',
+            other => other,
+        };
+        for character in character.to_lowercase() {
+            if !character.is_whitespace()
+                && !matches!(
+                    character,
+                    '・' | '･' | '-' | '‐' | '‑' | '‒' | '–' | '—' | '―' | '_'
+                )
+            {
+                normalized.push(character);
+            }
+        }
+    }
+    normalized
+}
+
+/// 地域名の一部から観測点名を検索する結果。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ObservationStationMatch {
+    pub score: f64,
+    pub station: ObservationStation,
+}
+
+/// 地域名の一部や都道府県付きの表記から観測点候補を検索する。
+///
+/// 結果の `station.name` は入力に合わせて変換せず、情報源との照合に使える原文を返す。
+pub fn search_observation_stations(
+    query: &str,
+    limit: Option<usize>,
+) -> Result<Vec<ObservationStationMatch>> {
+    if let Some(limit) = limit {
+        ensure!(limit > 0, "limitは1以上で指定してください");
+    }
+    let query = normalize_search_text(query);
+    ensure!(!query.is_empty(), "検索語を1文字以上で指定してください");
+
+    let mut matches = observation_stations()
+        .iter()
+        .copied()
+        .filter_map(|station| {
+            let name = normalize_search_text(station.name);
+            let pref = normalize_search_text(station.pref);
+            let pref_stem = pref
+                .strip_suffix('都')
+                .or_else(|| pref.strip_suffix('府'))
+                .or_else(|| pref.strip_suffix('県'))
+                .unwrap_or(&pref);
+            let mut combined_forms = vec![format!("{pref}{name}")];
+            if !pref_stem.is_empty() && name.starts_with(pref_stem) {
+                let alias = format!("{pref}{}", &name[pref_stem.len()..]);
+                if !combined_forms.iter().any(|form| form == &alias) {
+                    combined_forms.push(alias);
+                }
+            }
+
+            let score = if query == name {
+                1.0
+            } else if name.contains(&query) {
+                0.70 + 0.30 * query.chars().count() as f64 / name.chars().count() as f64
+            } else if query == pref {
+                0.65
+            } else if let Some(combined) = combined_forms.iter().find(|form| form.contains(&query))
+            {
+                0.50 + 0.15 * query.chars().count() as f64 / combined.chars().count() as f64
+            } else {
+                return None;
+            };
+            Some(ObservationStationMatch { score, station })
+        })
+        .collect::<Vec<_>>();
+
+    matches.sort_by(|left, right| {
+        right
+            .score
+            .total_cmp(&left.score)
+            .then_with(|| left.station.name.len().cmp(&right.station.name.len()))
+            .then_with(|| left.station.pref.cmp(right.station.pref))
+            .then_with(|| left.station.name.cmp(right.station.name))
+    });
+    if let Some(limit) = limit {
+        matches.truncate(limit);
+    }
+    Ok(matches)
 }
 
 /// 都道府県名 → 代表座標 (緯度, 経度)。県名は 551 の `points.pref` の表記に合わせる。
@@ -107,8 +231,8 @@ pub fn pref_coord(pref: &str) -> Option<(f64, f64)> {
 
 /// 観測点を地図に描く `(緯度, 経度, 震度スケール)` の一覧へ変換する。
 ///
-/// `addr` が観測点座標テーブルに一致する地点は、その市区町村・観測点の正確な座標に
-/// 個別のマーカーとしてプロットする。一致しない地点（震度速報の地域名など）は
+/// `isArea=false` の `addr` が観測点座標テーブルに一致する地点は、その観測点の公開座標に
+/// 個別のマーカーとしてプロットする。`isArea=true` の区域名や一致しない地点は
 /// 都道府県ごとにまとめ、代表座標へフォールバックする（同一県は最大震度を採用）。
 /// 代表座標も引けない県（海外・離島の予報区など）は除外する。
 pub fn points_to_markers(points: &[Point]) -> Vec<(f64, f64, i32)> {
@@ -119,11 +243,15 @@ pub fn points_to_markers(points: &[Point]) -> Vec<(f64, f64, i32)> {
         if p.scale < 0 || p.pref.is_empty() {
             continue;
         }
-        if let Some((lat, lon)) = observation_point_coord(&p.addr) {
-            markers.push((lat, lon, p.scale));
-            continue;
+        if !p.is_area {
+            if let Some((lat, lon)) = observation_point_coord(&p.pref, &p.addr) {
+                markers.push((lat, lon, p.scale));
+                continue;
+            }
         }
-        let entry = fallback_max_by_pref.entry(p.pref.as_str()).or_insert(p.scale);
+        let entry = fallback_max_by_pref
+            .entry(p.pref.as_str())
+            .or_insert(p.scale);
         if p.scale > *entry {
             *entry = p.scale;
         }
@@ -140,9 +268,9 @@ pub fn points_to_markers(points: &[Point]) -> Vec<(f64, f64, i32)> {
 
 /// 緊急地震速報(556)の対象地域を地図に描く `(緯度, 経度, 予想震度スケール)` の一覧へ変換する。
 ///
-/// `points_to_markers` の 556 版。`areas.name`（地域名。例: "神奈川県西部"）が観測点座標
-/// テーブルに一致すればその座標を使うが、556 の地域名は市区町村単位ではないため通常は
-/// 一致せず、都道府県の代表座標へフォールバックする（同一県は最大予想震度を採用）。
+/// `points_to_markers` の 556 版。`areas.name` は観測点ではなく府県予報区の細分区域名
+/// （例: "神奈川県西部"）なので観測点座標テーブルとは照合せず、都道府県の代表座標へ
+/// フォールバックする（同一県は最大予想震度を採用）。
 pub fn eew_areas_to_markers(areas: &[EewArea]) -> Vec<(f64, f64, i32)> {
     let mut markers: Vec<(f64, f64, i32)> = Vec::new();
     let mut fallback_max_by_pref: HashMap<String, i32> = HashMap::new();
@@ -153,10 +281,6 @@ pub fn eew_areas_to_markers(areas: &[EewArea]) -> Vec<(f64, f64, i32)> {
         // 震度0（揺れを感じない）は描いても情報にならないので除外する。
         // 551 の points には 0 が無いため、この判定は 556 側にだけ必要。
         if scale <= 0 || a.pref.is_empty() {
-            continue;
-        }
-        if let Some((lat, lon)) = observation_point_coord(&a.name) {
-            markers.push((lat, lon, scale));
             continue;
         }
         let pref = display_pref(&a.pref);
@@ -183,6 +307,7 @@ mod tests {
         Point {
             pref: pref.to_string(),
             addr: String::new(),
+            is_area: false,
             scale,
         }
     }
@@ -191,6 +316,7 @@ mod tests {
         Point {
             pref: pref.to_string(),
             addr: addr.to_string(),
+            is_area: false,
             scale,
         }
     }
@@ -203,18 +329,112 @@ mod tests {
 
     #[test]
     fn observation_point_lookup() {
-        assert!(observation_point_coord("八戸市湊町").is_some());
-        assert!(observation_point_coord("存在しない観測点").is_none());
+        assert!(observation_point_coord("青森県", "八戸市湊町").is_some());
+        assert!(observation_point_coord("青森県", "存在しない観測点").is_none());
+    }
+
+    #[test]
+    fn expanded_stations_include_local_government_and_nied() {
+        // 公開JSONに収録された地方公共団体・防災科学技術研究所の観測点。
+        assert_eq!(
+            observation_point_coord("北海道", "新篠津村第４７線"),
+            Some((43.23, 141.65))
+        );
+        assert_eq!(
+            observation_point_coord("北海道", "石狩市厚田"),
+            Some((43.40, 141.43))
+        );
+        let markers = points_to_markers(&[
+            pt_addr("北海道", "新篠津村第４７線", 30),
+            pt_addr("北海道", "石狩市厚田", 40),
+        ]);
+        assert_eq!(markers, vec![(43.23, 141.65, 30), (43.40, 141.43, 40)]);
+    }
+
+    #[test]
+    fn bundled_coordinate_uses_public_json_value() {
+        assert_eq!(
+            observation_point_coord("北海道", "石狩市花川"),
+            Some((43.17, 141.32))
+        );
+    }
+
+    #[test]
+    fn station_lookup_requires_matching_prefecture() {
+        assert_eq!(
+            observation_point_coord("青森", "八戸市湊町"),
+            observation_point_coord("青森県", "八戸市湊町")
+        );
+        assert!(observation_point_coord("岩手県", "八戸市湊町").is_none());
+        assert!(observation_point_coord("", "八戸市湊町").is_none());
+        let markers = points_to_markers(&[pt_addr("岩手県", "八戸市湊町", 40)]);
+        assert_eq!((markers[0].0, markers[0].1), pref_coord("岩手県").unwrap());
+    }
+
+    #[test]
+    fn station_search_returns_source_names_for_partial_region() {
+        let matches = search_observation_stations("東京都千代田区", Some(3)).unwrap();
+        assert_eq!(matches.len(), 3);
+        assert_eq!(matches[0].station.pref, "東京都");
+        assert!(matches
+            .iter()
+            .all(|matched| matched.station.name.contains("東京千代田区")));
+        assert!(matches[0].score >= matches[1].score);
+    }
+
+    #[test]
+    fn station_search_normalizes_whitespace_and_rejects_empty_query() {
+        let matches = search_observation_stations("東京　千代田区", Some(1)).unwrap();
+        assert_eq!(matches[0].station.name, "東京千代田区麹町");
+        assert!(search_observation_stations(" ", Some(5)).is_err());
+        assert!(search_observation_stations("東京", Some(0)).is_err());
+        assert!(search_observation_stations("東京", None).unwrap().len() > 5);
+    }
+
+    #[test]
+    fn area_named_like_a_station_is_still_not_plotted_as_a_station() {
+        // 551 の `isArea=true` は区域名であり、文字列が偶然観測点名と同じでも
+        // 観測点の座標へ誤って置かない。
+        let area = Point {
+            pref: "青森県".to_string(),
+            addr: "八戸市湊町".to_string(),
+            is_area: true,
+            scale: 40,
+        };
+        let markers = points_to_markers(&[area]);
+        assert_eq!(markers.len(), 1);
+        assert_eq!((markers[0].0, markers[0].1), pref_coord("青森県").unwrap());
+    }
+
+    #[test]
+    fn bundled_stations_are_valid_and_unique() {
+        let mut keys = std::collections::HashSet::new();
+        for line in OBSERVATION_STATIONS_TSV
+            .lines()
+            .filter(|line| !line.starts_with('#'))
+        {
+            let cols: Vec<_> = line.split('\t').collect();
+            assert_eq!(cols.len(), 4);
+            assert!(pref_coord(cols[0]).is_some(), "未知の都道府県: {line}");
+            assert!(!cols[1].is_empty());
+            assert!(keys.insert((cols[0], cols[1])), "重複: {line}");
+            let lat: f64 = cols[2].parse().unwrap();
+            let lon: f64 = cols[3].parse().unwrap();
+            assert!((-90.0..=90.0).contains(&lat) && (-180.0..=180.0).contains(&lon));
+            assert_ne!((lat, lon), (0.0, 0.0));
+        }
+        assert!(keys.len() > 4000);
+        assert_eq!(keys.len(), station_coords().len());
     }
 
     #[test]
     fn markers_use_observation_point_coord_when_addr_matches() {
         // addr が観測点座標テーブルに一致する場合は、県代表座標ではなく
-        // その観測点の正確な座標を個別マーカーとして使う。
+        // その観測点の公開座標を個別マーカーとして使う。
         let points = vec![pt_addr("青森県", "八戸市湊町", 40)];
         let markers = points_to_markers(&points);
         assert_eq!(markers.len(), 1);
-        let station_coord = observation_point_coord("八戸市湊町").unwrap();
+        let station_coord = observation_point_coord("青森県", "八戸市湊町").unwrap();
         assert_eq!((markers[0].0, markers[0].1), station_coord);
         assert_ne!((markers[0].0, markers[0].1), pref_coord("青森県").unwrap());
         assert_eq!(markers[0].2, 40);
@@ -223,7 +443,10 @@ mod tests {
     #[test]
     fn markers_fall_back_to_pref_when_addr_unmatched() {
         // 震度速報などの地域名（addr）は座標テーブルに無いため、県代表座標に集約される。
-        let points = vec![pt_addr("宮城県", "宮城県北部", 45), pt_addr("宮城県", "宮城県南部", 30)];
+        let points = vec![
+            pt_addr("宮城県", "宮城県北部", 45),
+            pt_addr("宮城県", "宮城県南部", 30),
+        ];
         let markers = points_to_markers(&points);
         assert_eq!(markers.len(), 1);
         assert_eq!((markers[0].0, markers[0].1), pref_coord("宮城県").unwrap());
@@ -260,16 +483,25 @@ mod tests {
     fn eew_markers_fall_back_to_pref_representative_coord() {
         // 556 の地域名（例: "神奈川県西部"）は市区町村単位ではないため、
         // 通常は観測点座標テーブルに一致せず県代表座標に集約される。
-        let areas = vec![area("神奈川", "神奈川県西部", 45), area("神奈川", "神奈川県東部", 40)];
+        let areas = vec![
+            area("神奈川", "神奈川県西部", 45),
+            area("神奈川", "神奈川県東部", 40),
+        ];
         let markers = eew_areas_to_markers(&areas);
         assert_eq!(markers.len(), 1);
-        assert_eq!((markers[0].0, markers[0].1), pref_coord("神奈川県").unwrap());
+        assert_eq!(
+            (markers[0].0, markers[0].1),
+            pref_coord("神奈川県").unwrap()
+        );
         assert_eq!(markers[0].2, 45); // 最大予想震度を採用
     }
 
     #[test]
     fn eew_markers_take_max_scale_per_pref() {
-        let areas = vec![area("神奈川", "神奈川県西部", 40), area("大阪", "大阪府北部", 30)];
+        let areas = vec![
+            area("神奈川", "神奈川県西部", 40),
+            area("大阪", "大阪府北部", 30),
+        ];
         let mut markers = eew_areas_to_markers(&areas);
         markers.sort_by_key(|m| m.2);
         assert_eq!(markers.len(), 2);
@@ -304,6 +536,9 @@ mod tests {
         let areas = vec![area("神奈川", "神奈川県西部", 0)];
         assert!(eew_areas_to_markers(&areas).is_empty());
         // 震度1以上は描く。
-        assert_eq!(eew_areas_to_markers(&[area("神奈川", "神奈川県西部", 10)]).len(), 1);
+        assert_eq!(
+            eew_areas_to_markers(&[area("神奈川", "神奈川県西部", 10)]).len(),
+            1
+        );
     }
 }

@@ -382,14 +382,20 @@ mod tests {
     fn focus_keeps_bounds_when_already_close() {
         // 元から狭い範囲に収まっていれば絞り込みは働かない。
         let markers = vec![(33.2, 131.6, 45), (33.5, 131.4, 30)];
-        assert_eq!(focus_bounds(Some(EPICENTER), &markers), (33.2, 33.5, 131.4, 131.6));
+        assert_eq!(
+            focus_bounds(Some(EPICENTER), &markers),
+            (33.2, 33.5, 131.4, 131.6)
+        );
     }
 
     #[test]
     fn focus_keeps_bounds_when_strong_shaking_is_wide() {
         // 強い揺れ自体が広域に及ぶ地震は、絞っても引きのまま＝広く写すのが正しい。
         let markers = vec![(33.2, 131.6, 50), (39.7, 140.1, 50)];
-        assert_eq!(focus_bounds(Some(EPICENTER), &markers), (33.2, 39.7, 131.6, 140.1));
+        assert_eq!(
+            focus_bounds(Some(EPICENTER), &markers),
+            (33.2, 39.7, 131.6, 140.1)
+        );
     }
 
     #[test]
@@ -397,7 +403,10 @@ mod tests {
         // 全地点が震度1（深発地震の異常震域など）では、絞ると震源1点だけになり
         // 揺れの広がりが見えなくなるため、枠は広いまま維持する。
         let markers = vec![(33.2, 131.6, 10), (39.7, 140.1, 10)];
-        assert_eq!(focus_bounds(Some(EPICENTER), &markers), (33.2, 39.7, 131.6, 140.1));
+        assert_eq!(
+            focus_bounds(Some(EPICENTER), &markers),
+            (33.2, 39.7, 131.6, 140.1)
+        );
     }
 
     #[test]
@@ -406,7 +415,10 @@ mod tests {
         let markers = vec![(33.2, 131.6, 45), (33.5, 131.4, 40), (39.7, 140.1, 10)];
         let b = focus_bounds(None, &markers);
         assert!(b.1 < 39.0, "遠方の震度1が枠から外れる: {b:?}");
-        assert!(zoom_of(b) >= FOCUS_ZOOM_MIN, "強い揺れの範囲まで寄る: {b:?}");
+        assert!(
+            zoom_of(b) >= FOCUS_ZOOM_MIN,
+            "強い揺れの範囲まで寄る: {b:?}"
+        );
     }
 
     #[test]

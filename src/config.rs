@@ -3,7 +3,9 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
-use anyhow::{anyhow, ensure, Context, Result};
+use anyhow::{anyhow, ensure};
+use anyhow::{Context, Result};
+use serde::Deserialize;
 
 use crate::intensity::REGIONS;
 
@@ -20,6 +22,8 @@ pub struct WebhookConfig {
     /// ログに表示する設定ファイル名。
     pub name: String,
     pub webhook_url: String,
+    /// この送信先で強調表示する地域・観測点。
+    pub watched_points: Vec<WatchedPoint>,
     /// 地方ごとの通知する最小スケール。未設定の地方は `other_min_scale`。
     pub region_min_scales: HashMap<String, i32>,
     pub other_min_scale: i32,
@@ -254,12 +258,55 @@ impl WebhookConfig {
         Ok(Self {
             name: name.to_string(),
             webhook_url,
+            watched_points: parse_watched_points(
+                &get("WATCHED_POINTS").unwrap_or_else(|| "[]".to_string()),
+            )?,
             region_min_scales,
             other_min_scale,
             attach_map,
             tile_url_template,
         })
     }
+}
+
+/// 情報源の都道府県と地域・観測点名で照合する登録地点。
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct WatchedPoint {
+    pub pref: String,
+    pub name: String,
+    #[serde(default)]
+    pub label: String,
+}
+
+fn parse_watched_points(raw: &str) -> Result<Vec<WatchedPoint>> {
+    let mut points: Vec<WatchedPoint> = serde_json::from_str(raw)
+        .context("WATCHED_POINTS は pref・name・任意の label を持つ JSON 配列で指定してください")?;
+    for (i, point) in points.iter_mut().enumerate() {
+        point.pref = point.pref.trim().to_string();
+        point.name = point.name.trim().to_string();
+        point.label = point.label.trim().to_string();
+        ensure!(
+            !point.pref.is_empty() && !point.name.is_empty(),
+            "WATCHED_POINTS の {} 番目: pref と name は必須です",
+            i + 1
+        );
+        for value in [&point.pref, &point.name, &point.label] {
+            ensure!(
+                value.chars().count() <= 100 && !value.chars().any(char::is_control),
+                "WATCHED_POINTS の {} 番目: 各項目は改行なしの100文字以内で指定してください",
+                i + 1
+            );
+        }
+    }
+    // 登録順を維持し、まったく同じ設定の重複を除く。
+    let mut unique = Vec::new();
+    for point in points {
+        if !unique.contains(&point) {
+            unique.push(point);
+        }
+    }
+    Ok(unique)
 }
 
 #[cfg(test)]
@@ -324,6 +371,37 @@ mod tests {
     }
 
     #[test]
+    fn watched_points_parse_and_deduplicate() {
+        let points = parse_watched_points(
+            r#"[
+            {"pref":" 東京都 ","name":"東京都23区","label":" 自宅周辺 "},
+            {"pref":"東京都","name":"東京都23区","label":"自宅周辺"},
+            {"pref":"神奈川県","name":"神奈川県東部"}
+        ]"#,
+        )
+        .unwrap();
+        assert_eq!(points.len(), 2);
+        assert_eq!(points[0].pref, "東京都");
+        assert_eq!(points[0].label, "自宅周辺");
+        assert_eq!(points[1].label, "");
+        assert!(parse_watched_points("[]").unwrap().is_empty());
+    }
+
+    #[test]
+    fn invalid_watched_points_are_rejected() {
+        for raw in [
+            "",
+            "{}",
+            r#"[{"pref":"東京都"}]"#,
+            r#"[{"pref":" ","name":"東京都23区"}]"#,
+            r#"[{"pref":"東京都","name":"東京都23区","lable":"自宅"}]"#,
+            r#"[{"pref":"東京都","name":"東京都23区","label":"自宅\n職場"}]"#,
+        ] {
+            assert!(parse_watched_points(raw).is_err(), "{raw}");
+        }
+    }
+
+    #[test]
     fn complete_notification_settings_are_independent() {
         let config = config(
             &[
@@ -339,6 +417,10 @@ mod tests {
                     "first.env",
                     &[
                         ("DISCORD_WEBHOOK_URL", "first"),
+                        (
+                            "WATCHED_POINTS",
+                            r#"[{"pref":"東京都","name":"東京都23区","label":"自宅"}]"#,
+                        ),
                         ("OTHER_MIN_SCALE", "40"),
                         ("TOHOKU_MIN_SCALE", "30"),
                         ("KANTO_MIN_SCALE", "30"),
@@ -350,6 +432,10 @@ mod tests {
                     "second.env",
                     &[
                         ("DISCORD_WEBHOOK_URL", "second"),
+                        (
+                            "WATCHED_POINTS",
+                            r#"[{"pref":"大阪府","name":"大阪府北部","label":"職場"}]"#,
+                        ),
                         ("OTHER_MIN_SCALE", "55"),
                         ("TOHOKU_MIN_SCALE", "50"),
                         ("KANTO_MIN_SCALE", "45"),
@@ -377,6 +463,8 @@ mod tests {
         assert!(!second.attach_map);
         assert_eq!(first.tile_url_template, "first-tiles");
         assert_ne!(second.tile_url_template, "first-tiles");
+        assert_eq!(first.watched_points[0].label, "自宅");
+        assert_eq!(second.watched_points[0].pref, "大阪府");
     }
 
     #[test]

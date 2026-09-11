@@ -85,6 +85,10 @@ pub struct Point {
     /// 観測点または地域名。
     #[serde(default)]
     pub addr: String,
+    /// 区域名かどうか。震度速報では true、各地の震度では false。
+    /// P2P地震情報の公式仕様では `addr` が区域名の場合に true になる。
+    #[serde(rename = "isArea", default)]
+    pub is_area: bool,
     /// その地点の震度スケール（Earthquake.max_scale と同じ値域）。
     /// 揺れが強く震度情報を入手できていない地点には 46（5弱以上と推定）が入る。
     #[serde(default = "minus_one")]
@@ -243,8 +247,34 @@ mod tests {
     #[test]
     fn other_types_are_detail() {
         // 各地の震度・震源情報などは詳報として扱う。
-        for t in ["DetailScale", "ScaleAndDestination", "Destination", "Foreign", "Other", ""] {
+        for t in [
+            "DetailScale",
+            "ScaleAndDestination",
+            "Destination",
+            "Foreign",
+            "Other",
+            "",
+        ] {
             assert!(!issue(t).is_prompt(), "{t} は詳報扱いのはず");
         }
+    }
+
+    #[test]
+    fn point_area_flag_follows_p2p_schema() {
+        let quake: JmaQuake = serde_json::from_str(
+            r#"{"code":551,"points":[
+                {"pref":"熊本県","addr":"熊本県天草・芦北","isArea":true,"scale":30},
+                {"pref":"熊本県","addr":"上天草市大矢野町","isArea":false,"scale":30}
+            ]}"#,
+        )
+        .unwrap();
+        assert!(quake.points[0].is_area);
+        assert!(!quake.points[1].is_area);
+
+        let without_flag: JmaQuake = serde_json::from_str(
+            r#"{"code":551,"points":[{"pref":"青森県","addr":"八戸市湊町","scale":10}]}"#,
+        )
+        .unwrap();
+        assert!(!without_flag.points[0].is_area);
     }
 }
