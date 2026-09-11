@@ -38,24 +38,31 @@
 
 ## 更新方法
 
-リポジトリのルートで実行します。Python 3の標準ライブラリのみを使用します。
+リポジトリのルートで実行します。Rustの補助バイナリとして実行します。
 
 ```sh
-python3 scripts/update_observation_stations.py
+cargo run --bin update_observation_stations --
 ```
 
 取得済みJSONから再生成する場合：
 
 ```sh
-python3 scripts/update_observation_stations.py --input /path/to/stations.json
+cargo run --bin update_observation_stations -- --input /path/to/stations.json
 ```
+
+出力先を変える場合は `--output /path/to/observation_stations.tsv` を追加します。
 
 入力の空配列・重複・不正な座標・都道府県コードは、既存TSVを書き換える前にエラーにします。生成後は差分、件数、移転や名称変更を確認し、次の検証を行って再ビルドしてください。
 
 ```sh
-python3 -B -m unittest discover -s scripts -p 'test_*.py'
 cargo test --offline
 cargo build --release
 ```
 
-公開JSONはマップ用の静的ファイルであり、固定仕様のAPIとしての保証は確認できません。URL・形式の変更時は更新スクリプトを見直してください。bot稼働時には組み込みTSVを使うため、取得先の障害は通知処理へ影響しません。
+P2P履歴と観測点名の一致を監査する場合：
+
+```sh
+cargo run --bin audit_p2p_points -- /path/to/history.json
+```
+
+公開JSONはマップ用の静的ファイルであり、固定仕様のAPIとしての保証は確認できません。URL・形式の変更時は更新コマンドを見直してください。bot稼働時には組み込みTSVを使うため、取得先の障害は通知処理へ影響しません。
