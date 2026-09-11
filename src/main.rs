@@ -13,6 +13,7 @@ mod model;
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -24,6 +25,7 @@ use tokio_tungstenite::tungstenite::Message;
 use tracing::{error, info, warn, Instrument};
 
 use crate::config::{Config, WebhookConfig};
+use crate::geo::search_observation_stations;
 use crate::intensity::{decide, decide_eew, eew_max_scale, eew_summary, tsunami_grade_rank};
 use crate::model::{Eew, Envelope, JmaQuake, Tsunami};
 
@@ -242,10 +244,201 @@ struct DedupState {
     quakes: QuakeTracker,
 }
 
+/// 通知機能を起動せず、組み込み観測点から登録名を検索するCLIを実行する。
+fn run_search_point_command(args: &[String]) -> Result<bool> {
+    if args.get(1).map(String::as_str) != Some("search-point") {
+        return Ok(false);
+    }
+
+    if matches!(args.get(2).map(String::as_str), Some("-h" | "--help")) {
+        println!("使い方: cargo run -- search-point <地域名の一部> [--limit N]\nデフォルトでは全候補を表示します。\n");
+        return Ok(true);
+    }
+
+    let query = args.get(2).ok_or_else(|| {
+        anyhow!("検索語を指定してください（例: cargo run -- search-point 千代田区）")
+    })?;
+    let mut limit = None;
+    let mut index = 3;
+    while index < args.len() {
+        if args[index] != "--limit" {
+            return Err(anyhow!("未知の引数です: {}", args[index]));
+        }
+        index += 1;
+        let raw = args
+            .get(index)
+            .ok_or_else(|| anyhow!("--limit の値を指定してください"))?;
+        limit = Some(
+            raw.parse::<usize>()
+                .map_err(|_| anyhow!("--limit は正の整数で指定してください"))?,
+        );
+        index += 1;
+    }
+
+    let matches = search_observation_stations(query, limit)?;
+    if matches.is_empty() {
+        println!("候補が見つかりませんでした");
+    }
+    for matched in matches {
+        let station = matched.station;
+        println!("{}\t{}", station.pref, station.name);
+    }
+    Ok(true)
+}
+
+/// 通知設定ファイルのパスをコマンドラインから取得する。
+///
+/// 指定が無い場合は`QUAKE_ALERT_CONFIG`、それも無ければ`config.toml`を使う。
+fn config_path_from_args(args: &[String]) -> Result<PathBuf> {
+    let mut path = std::env::var("QUAKE_ALERT_CONFIG")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("config.toml"));
+    let mut index = 1;
+    while index < args.len() {
+        if args[index] == "--config" {
+            ensure_next_config_path(args.get(index + 1).map(String::as_str), &mut path)?;
+            index += 2;
+        } else if let Some(value) = args[index].strip_prefix("--config=") {
+            ensure_next_config_path(Some(value), &mut path)?;
+            index += 1;
+        } else {
+            index += 1;
+        }
+    }
+    Ok(path)
+}
+
+fn ensure_next_config_path(value: Option<&str>, path: &mut PathBuf) -> Result<()> {
+    let value = value.ok_or_else(|| anyhow!("--configの値を指定してください"))?;
+    if value.trim().is_empty() {
+        return Err(anyhow!("--configのパスを指定してください"));
+    }
+    *path = PathBuf::from(value);
+    Ok(())
+}
+
+/// 通知を送信せず、履歴 API の最新報から地図画像だけを生成する CLI を実行する。
+///
+/// 画像の座標やマーカー配置を目視で確認したいときに使う。出力先を指定しない場合は
+/// システムの一時ディレクトリへ保存するため、リポジトリのファイルを変更しない。
+async fn run_preview_map_command(args: &[String], config_path: &Path) -> Result<bool> {
+    if args.get(1).map(String::as_str) != Some("preview-map") {
+        return Ok(false);
+    }
+
+    if matches!(args.get(2).map(String::as_str), Some("-h" | "--help")) {
+        println!(
+            "使い方: cargo run -- preview-map [出力先] [--richest] [--config PATH]\nデフォルトの出力先: システム一時ディレクトリの quake-alert-bot-preview.webp\n--richest を付けると、履歴内で観測地点が最も多い報を選びます。\n--config を省略すると config.toml を使います。\n"
+        );
+        return Ok(true);
+    }
+    let mut output = None;
+    let mut richest = false;
+    let mut index = 2;
+    while index < args.len() {
+        let argument = &args[index];
+        if argument == "--config" {
+            index += 2;
+            continue;
+        }
+        if argument.starts_with("--config=") {
+            index += 1;
+            continue;
+        }
+        if argument == "--richest" {
+            richest = true;
+        } else if output.is_none() {
+            output = Some(PathBuf::from(argument));
+        } else {
+            return Err(anyhow!("出力先は1つだけ指定してください: {argument}"));
+        }
+        index += 1;
+    }
+
+    let output =
+        output.unwrap_or_else(|| std::env::temp_dir().join("quake-alert-bot-preview.webp"));
+    let http = reqwest::Client::builder()
+        .user_agent("quake-alert-bot/0.1 (+https://github.com/)")
+        .timeout(Duration::from_secs(30))
+        .build()?;
+    let items = fetch_history(&http, HISTORY_URL).await?;
+
+    let mut selected = None;
+    for item in items {
+        let quake: JmaQuake = match serde_json::from_value(item) {
+            Ok(quake) => quake,
+            Err(_) => continue,
+        };
+        let markers = geo::points_to_markers(&quake.points);
+        let hypocenter = quake.earthquake.hypocenter.has_valid_coords().then_some((
+            quake.earthquake.hypocenter.latitude,
+            quake.earthquake.hypocenter.longitude,
+        ));
+        if hypocenter.is_some() || !markers.is_empty() {
+            if !richest {
+                selected = Some((quake, hypocenter, markers));
+                break;
+            }
+            let replace = selected
+                .as_ref()
+                .map(|(_, _, current_markers)| markers.len() > current_markers.len())
+                .unwrap_or(true);
+            if replace {
+                selected = Some((quake, hypocenter, markers));
+            }
+        }
+    }
+    let (quake, hypocenter, markers) =
+        selected.ok_or_else(|| anyhow!("履歴に地図を生成できる地震情報がありませんでした"))?;
+
+    let tile_tpl = Config::tile_url_template_from_file(config_path)?;
+    let scale = quake.earthquake.max_scale;
+    let marker_count = markers.len();
+    let task = tokio::task::spawn_blocking(move || match hypocenter {
+        Some((lat, lon)) => {
+            mapgen::render_quake_map_with_points(lat, lon, scale, &markers, &tile_tpl)
+        }
+        None => mapgen::render_markers_map(&markers, &tile_tpl),
+    });
+    let image = match tokio::time::timeout(MAP_TIMEOUT, task).await {
+        Ok(Ok(result)) => result?,
+        Ok(Err(error)) => return Err(anyhow!("地図生成タスクが異常終了しました: {error}")),
+        Err(_) => {
+            return Err(anyhow!(
+                "地図生成が{}秒以内に終わりませんでした",
+                MAP_TIMEOUT.as_secs()
+            ))
+        }
+    };
+
+    std::fs::write(&output, image)?;
+    println!(
+        "{}\n{} {} / {}\nマーカー: {}件",
+        output.display(),
+        quake.earthquake.time,
+        quake.earthquake.hypocenter.name,
+        quake.issue.issue_type,
+        marker_count
+    );
+    Ok(true)
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
-    // .env があれば読み込む（無ければ無視）。
+    let args: Vec<String> = std::env::args().collect();
+    if run_search_point_command(&args)? {
+        return Ok(());
+    }
+
+    // .env があれば読み込む（無ければ無視）。Webhook URLなどの秘密値を環境変数から
+    // 読めるよう、TOML設定を読む前に読み込む。
     let _ = dotenvy::dotenv();
+    let config_path = config_path_from_args(&args)?;
+    if run_preview_map_command(&args, &config_path).await? {
+        return Ok(());
+    }
 
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -254,8 +447,9 @@ async fn main() -> Result<()> {
         )
         .init();
 
-    let config = Config::from_env()?;
+    let config = Config::from_file(&config_path)?;
     info!(
+        config = %config_path.display(),
         ws_url = %config.ws_url,
         webhooks = config.webhooks.len(),
         "地震botを起動しました"
@@ -1189,7 +1383,7 @@ async fn run_test_prompt(config: &WebhookConfig, http: &reqwest::Client) -> Resu
         }
     }
 
-    warn!("震源未確定で通知条件を満たす報が履歴にありませんでした。しきい値（OTHER_MIN_SCALE 等）を下げて再試行してください");
+    warn!("震源未確定で通知条件を満たす報が履歴にありませんでした。TOMLのother_min_scale等を下げて再試行してください");
     Ok(())
 }
 
@@ -1396,7 +1590,8 @@ async fn handle_quake(
     )
     .await;
 
-    let payload = discord::build_payload(&quake, &decision.reason, image.is_some(), is_test);
+    let mut payload = discord::build_payload(&quake, &decision.reason, image.is_some(), is_test);
+    discord::highlight_watched_quake(&mut payload, &quake, &config.watched_points);
     let signature = signature_of(&payload);
     let key = eq.time.clone();
 
@@ -1524,7 +1719,8 @@ async fn handle_eew(
     )
     .await;
 
-    let payload = discord::build_eew_payload(&eew, &reason, image.is_some(), is_test);
+    let mut payload = discord::build_eew_payload(&eew, &reason, image.is_some(), is_test);
+    discord::highlight_watched_eew(&mut payload, &eew, &config.watched_points);
     let signature = signature_of(&payload);
 
     // 投稿済みなら同じメッセージを差し替え、未投稿なら新規投稿する（551 と同じ方針）。
@@ -1699,6 +1895,7 @@ mod tests {
         WebhookConfig {
             webhook_url: "http://127.0.0.1:1/failing-webhook".to_string(),
             name: "test".to_string(),
+            watched_points: Vec::new(),
             region_min_scales: HashMap::new(),
             other_min_scale: 50,
             attach_map: false,

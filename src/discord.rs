@@ -7,14 +7,116 @@ use reqwest::StatusCode;
 use serde_json::{json, Value};
 use tracing::warn;
 
+use crate::config::WatchedPoint;
 use crate::intensity::{
-    embed_color, eew_area_scale, eew_max_scale, eew_max_scale_label, eew_scale_label,
-    has_tsunami, is_unbounded_at, scale_label, tsunami_grade_color, tsunami_grade_label,
+    eew_area_scale, eew_max_scale, eew_max_scale_label, eew_scale_label, embed_color, has_tsunami,
+    is_unbounded_at, normalize_pref, scale_label, tsunami_grade_color, tsunami_grade_label,
     tsunami_grade_rank, tsunami_label,
 };
 use crate::model::{Eew, JmaQuake, Point, Tsunami};
 
 const MAP_FILE_NAME: &str = "quake.webp";
+
+/// 登録名は都道府県と地域・観測点名の完全一致で照合する。
+/// 周辺地域の値から登録地点の震度を推測しない。
+fn matches_watched(point: &WatchedPoint, pref: &str, name: &str) -> bool {
+    normalize_pref(&point.pref) == normalize_pref(pref) && point.name == name
+}
+
+/// 任意の表示名に含まれる Discord の Markdown 記号を無効化する。
+fn escape_markdown(value: &str) -> String {
+    let mut escaped = String::new();
+    for c in value.chars() {
+        if "\\`*_~|>[]()#".contains(c) {
+            escaped.push('\\');
+        }
+        escaped.push(c);
+    }
+    escaped
+}
+
+fn watched_line(point: &WatchedPoint, intensity: &str) -> String {
+    let name = escape_markdown(&point.name);
+    let pref = escape_markdown(&point.pref);
+    let place = if point.label.is_empty() {
+        format!("{name}（{pref}）")
+    } else {
+        format!("{}（{pref}・{name}）", escape_markdown(&point.label))
+    };
+    format!("**{place}：震度{intensity}**")
+}
+
+/// 件数にかかわらず Discord のフィールド長上限に収め、超過件数を明示する。
+fn prepend_watched_field(payload: &mut Value, title: &str, lines: Vec<String>) {
+    if lines.is_empty() {
+        return;
+    }
+    let mut value = String::new();
+    for (i, line) in lines.iter().enumerate() {
+        // 残り件数の表示用に余白を確保する。UTF-16で数え、絵文字も安全に扱う。
+        if value.encode_utf16().count() + line.encode_utf16().count() + 1 > 950 {
+            value.push_str(&format!("\nほか{}地点（表示上限）", lines.len() - i));
+            break;
+        }
+        if !value.is_empty() {
+            value.push('\n');
+        }
+        value.push_str(line);
+    }
+    if let Some(fields) = payload["embeds"][0]["fields"].as_array_mut() {
+        fields.insert(0, json!({"name": title, "value": value, "inline": false}));
+    }
+}
+
+/// 情報源に含まれる登録地点の観測震度を先頭に表示する。
+pub fn highlight_watched_quake(payload: &mut Value, quake: &JmaQuake, watched: &[WatchedPoint]) {
+    let lines = watched
+        .iter()
+        .filter_map(|point| {
+            quake
+                .points
+                .iter()
+                .filter(|p| {
+                    matches_watched(point, &p.pref, &p.addr) && scale_label(p.scale) != "不明"
+                })
+                .max_by_key(|p| p.scale)
+                .map(|p| watched_line(point, scale_label(p.scale)))
+        })
+        .collect();
+    prepend_watched_field(payload, "📍 登録地点の震度", lines);
+}
+
+/// 情報源に含まれる登録地域の予想震度を先頭に表示する。取消報には表示しない。
+pub fn highlight_watched_eew(payload: &mut Value, eew: &Eew, watched: &[WatchedPoint]) {
+    if eew.cancelled {
+        return;
+    }
+    let lines = watched
+        .iter()
+        .filter_map(|point| {
+            eew.areas
+                .iter()
+                .filter(|a| {
+                    matches_watched(point, &a.pref, &a.name)
+                        && scale_label(eew_area_scale(a)) != "不明"
+                })
+                .max_by_key(|a| (a.scale_to == 99, eew_area_scale(a)))
+                .map(|a| {
+                    let upper = eew_scale_label(eew_area_scale(a), a.scale_to == 99);
+                    let intensity = if a.scale_to != 99
+                        && a.scale_from < a.scale_to
+                        && scale_label(a.scale_from) != "不明"
+                    {
+                        format!("{}〜{upper}", scale_label(a.scale_from))
+                    } else {
+                        upper
+                    };
+                    watched_line(point, &intensity)
+                })
+        })
+        .collect();
+    prepend_watched_field(payload, "📍 登録地点の予想震度", lines);
+}
 
 /// 送信を諦めるまでの試行回数。
 ///
@@ -58,7 +160,11 @@ pub fn build_payload(quake: &JmaQuake, reason: &str, with_image: bool, is_test: 
         ""
     };
     // 速報（震度速報）と詳報（各地の震度など）でタイトルの種別名を変える。
-    let kind = if is_prompt { "震度速報" } else { "地震情報" };
+    let kind = if is_prompt {
+        "震度速報"
+    } else {
+        "地震情報"
+    };
     let title = if is_test {
         format!(
             "🧪【テスト通知】{tsunami_mark}{kind}（最大震度 {}）",
@@ -82,6 +188,9 @@ pub fn build_payload(quake: &JmaQuake, reason: &str, with_image: bool, is_test: 
     let mut footer = String::from("出典: 気象庁（P2P地震情報経由）");
     if with_image {
         footer.push_str(" ・ 地図: 地理院タイル https://maps.gsi.go.jp/development/ichiran.html");
+        footer.push_str(
+            " ・ 観測点座標: 気象庁 https://ds.data.jma.go.jp/eqev/data/intens-st/ を本botで加工",
+        );
     }
     if is_test {
         footer.push_str(" ・ これはテスト送信です");
@@ -213,7 +322,11 @@ fn fmt_depth(depth: f64) -> String {
 ///
 /// 取消報(`cancelled`)の場合は取消の embed を返す。
 pub fn build_eew_payload(eew: &Eew, reason: &str, with_image: bool, is_test: bool) -> Value {
-    let test_prefix = if is_test { "🧪【テスト通知】" } else { "" };
+    let test_prefix = if is_test {
+        "🧪【テスト通知】"
+    } else {
+        ""
+    };
 
     if eew.cancelled {
         let embed = json!({
@@ -261,6 +374,9 @@ pub fn build_eew_payload(eew: &Eew, reason: &str, with_image: bool, is_test: boo
     let mut footer = String::from("出典: 気象庁 緊急地震速報（P2P地震情報経由・予想値）");
     if with_image {
         footer.push_str(" ・ 地図: 地理院タイル https://maps.gsi.go.jp/development/ichiran.html");
+        footer.push_str(
+            " ・ 観測点座標: 気象庁 https://ds.data.jma.go.jp/eqev/data/intens-st/ を本botで加工",
+        );
     }
 
     let mut embed = json!({
@@ -288,7 +404,11 @@ pub fn build_eew_payload(eew: &Eew, reason: &str, with_image: bool, is_test: boo
 ///
 /// 解除報(`cancelled`)の場合は解除の embed を返す。
 pub fn build_tsunami_payload(tsunami: &Tsunami, is_test: bool) -> Value {
-    let test_prefix = if is_test { "🧪【テスト通知】" } else { "" };
+    let test_prefix = if is_test {
+        "🧪【テスト通知】"
+    } else {
+        ""
+    };
 
     if tsunami.cancelled {
         let embed = json!({
@@ -590,6 +710,121 @@ pub async fn edit_message(
 mod tests {
     use super::*;
 
+    fn watched(pref: &str, name: &str, label: &str) -> WatchedPoint {
+        WatchedPoint {
+            pref: pref.into(),
+            name: name.into(),
+            label: label.into(),
+        }
+    }
+
+    #[test]
+    fn watched_quake_matches_exact_location_and_updates_payload() {
+        let mut quake: JmaQuake = serde_json::from_value(json!({
+            "code":551, "points":[
+                {"pref":"東京都","addr":"東京都23区","scale":30},
+                {"pref":"東京都","addr":"東京都23区","scale":40},
+                {"pref":"東京都","addr":"不明地点","scale":-1}
+            ]
+        }))
+        .unwrap();
+        let watched = vec![
+            watched("東京", "東京都23区", "自宅周辺"),
+            watched("千葉県", "東京都23区", "同名でも別の県"),
+            watched("東京都", "東京都23", "部分一致しない"),
+            watched("東京都", "不明地点", "不明"),
+        ];
+        let base = build_payload(&quake, "通知理由", false, false);
+        let mut payload = base.clone();
+        highlight_watched_quake(&mut payload, &quake, &watched);
+        assert_eq!(
+            payload["embeds"][0]["fields"][0]["name"],
+            "📍 登録地点の震度"
+        );
+        assert_eq!(
+            payload["embeds"][0]["fields"][0]["value"],
+            "**自宅周辺（東京・東京都23区）：震度4**"
+        );
+        let mut unchanged = base.clone();
+        highlight_watched_quake(&mut unchanged, &quake, &[]);
+        assert_eq!(unchanged, base);
+        highlight_watched_quake(&mut unchanged, &quake, &watched[1..]);
+        assert_eq!(unchanged, base);
+        quake.points[1].scale = 45;
+        let mut revised = base;
+        highlight_watched_quake(&mut revised, &quake, &watched);
+        assert_ne!(payload, revised);
+    }
+
+    #[test]
+    fn watched_eew_preserves_forecast_range_and_unbounded_scale() {
+        let mut eew: Eew = serde_json::from_value(json!({
+            "code":556,"areas":[
+                {"pref":"東京","name":"東京都23区","scaleFrom":40,"scaleTo":50},
+                {"pref":"神奈川","name":"神奈川県東部","scaleFrom":45,"scaleTo":99}
+            ]
+        }))
+        .unwrap();
+        let watched = vec![
+            watched("東京都", "東京都23区", "自宅周辺"),
+            watched("神奈川県", "神奈川県東部", "職場周辺"),
+        ];
+        let mut payload = build_eew_payload(&eew, "", false, false);
+        highlight_watched_eew(&mut payload, &eew, &watched);
+        let field = &payload["embeds"][0]["fields"][0];
+        assert_eq!(field["name"], "📍 登録地点の予想震度");
+        let value = field["value"].as_str().unwrap();
+        assert!(value.contains("震度4〜5強"));
+        assert!(value.contains("震度5弱程度以上"));
+        eew.cancelled = true;
+        let original = build_eew_payload(&eew, "", false, false);
+        let mut cancelled = original.clone();
+        highlight_watched_eew(&mut cancelled, &eew, &watched);
+        assert_eq!(cancelled, original);
+    }
+
+    #[test]
+    fn watched_eew_matches_hokkaido_forecast_prefecture() {
+        let eew: Eew = serde_json::from_value(json!({
+            "code":556,"areas":[
+                {"pref":"北海道道北","name":"北海道道北","scaleFrom":40,"scaleTo":50}
+            ]
+        }))
+        .unwrap();
+        let watched = vec![watched("北海道", "北海道道北", "登録地点")];
+        let mut payload = build_eew_payload(&eew, "", false, false);
+
+        highlight_watched_eew(&mut payload, &eew, &watched);
+
+        let field = &payload["embeds"][0]["fields"][0];
+        assert_eq!(field["name"], "📍 登録地点の予想震度");
+        assert_eq!(
+            field["value"],
+            "**登録地点（北海道・北海道道北）：震度4〜5強**"
+        );
+    }
+
+    #[test]
+    fn many_watched_points_fit_field_limit() {
+        let mut payload = json!({"embeds":[{"fields":[]}]});
+        let lines = (0..100)
+            .map(|i| {
+                watched_line(
+                    &watched("東京都", "東京都23区", &format!("地点{i}🏠")),
+                    "5強",
+                )
+            })
+            .collect();
+        prepend_watched_field(&mut payload, "📍 登録地点の震度", lines);
+        let value = payload["embeds"][0]["fields"][0]["value"].as_str().unwrap();
+        assert!(value.encode_utf16().count() <= 1024);
+        assert!(value.contains("地点0"));
+        assert!(value.ends_with("地点（表示上限）"));
+        assert!(
+            watched_line(&watched("東京都", "東京都23区", "*自宅*"), "4").contains("\\*自宅\\*")
+        );
+    }
+
     /// プロキシの自動検出は macOS で panic することがあるため無効にする。
     fn test_client(timeout: Duration) -> reqwest::Client {
         reqwest::Client::builder()
@@ -654,12 +889,16 @@ mod tests {
         let http = test_client(Duration::from_secs(5));
 
         let url = serve_once("これは JSON ではない").await;
-        let error = post_message(&http, &url, &json!({}), None).await.unwrap_err();
+        let error = post_message(&http, &url, &json!({}), None)
+            .await
+            .unwrap_err();
         assert!(!retry_is_safe(&error), "解析に失敗しても投げ直さない");
 
         // message id が無い応答も同じ。
         let url = serve_once("{}").await;
-        let error = post_message(&http, &url, &json!({}), None).await.unwrap_err();
+        let error = post_message(&http, &url, &json!({}), None)
+            .await
+            .unwrap_err();
         assert!(!retry_is_safe(&error), "message id が無くても投げ直さない");
     }
 
@@ -677,6 +916,7 @@ mod tests {
         Point {
             pref: pref.to_string(),
             addr: addr.to_string(),
+            is_area: false,
             scale,
         }
     }

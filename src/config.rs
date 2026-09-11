@@ -1,11 +1,16 @@
-//! 共通の接続設定と、独立した通知設定ファイルの読み込み。
+//! TOMLで記述した通知設定と、Webhook URLの環境変数を読み込む。
 
-use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::collections::{BTreeMap, HashMap};
+use std::path::Path;
 
-use anyhow::{anyhow, ensure, Context, Result};
+use anyhow::{ensure, Context, Result};
+use serde::Deserialize;
 
 use crate::intensity::REGIONS;
+
+const DEFAULT_WS_URL: &str = "wss://api.p2pquake.net/v2/ws";
+const DEFAULT_TILE_URL_TEMPLATE: &str =
+    "https://cyberjapandata.gsi.go.jp/xyz/blank/{z}/{x}/{y}.png";
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -14,501 +19,386 @@ pub struct Config {
     pub webhooks: Vec<WebhookConfig>,
 }
 
-/// 従来の通知設定一式。設定ごとに送信先と全地方の条件を指定できる。
+/// 1つのWebhookへ送る通知設定。
 #[derive(Debug, Clone)]
 pub struct WebhookConfig {
-    /// ログに表示する設定ファイル名。
+    /// TOMLの`[webhooks.<name>]`にある`<name>`。
     pub name: String,
     pub webhook_url: String,
-    /// 地方ごとの通知する最小スケール。未設定の地方は `other_min_scale`。
+    /// この送信先で強調表示する地域・観測点。
+    pub watched_points: Vec<WatchedPoint>,
+    /// 地方ごとの通知する最小スケール。未設定の地方は`other_min_scale`。
     pub region_min_scales: HashMap<String, i32>,
     pub other_min_scale: i32,
     pub attach_map: bool,
     pub tile_url_template: String,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TomlConfig {
+    /// 省略時は`P2PQUAKE_WS_URL`、それも無ければ公式の既定値を使う。
+    #[serde(default)]
+    ws_url: Option<String>,
+    #[serde(default)]
+    webhooks: BTreeMap<String, TomlWebhookConfig>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TomlWebhookConfig {
+    /// URLそのものを設定ファイルに書かず、この名前の環境変数から読む。
+    webhook_url_env: String,
+    #[serde(default)]
+    watched_points: Vec<WatchedPoint>,
+    #[serde(default)]
+    region_min_scales: HashMap<String, i32>,
+    #[serde(default = "default_other_min_scale")]
+    other_min_scale: i32,
+    #[serde(default = "default_attach_map")]
+    attach_map: bool,
+    #[serde(default = "default_tile_url_template")]
+    tile_url_template: String,
+}
+
+fn default_other_min_scale() -> i32 {
+    50
+}
+
+fn default_attach_map() -> bool {
+    true
+}
+
+fn default_tile_url_template() -> String {
+    DEFAULT_TILE_URL_TEMPLATE.to_string()
+}
+
 impl Config {
-    pub fn from_env() -> Result<Self> {
-        Self::from_sources(|key| std::env::var(key).ok(), read_notification_file)
+    /// 指定したTOML設定ファイルを読み込む。
+    pub fn from_file(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref();
+        let contents = std::fs::read_to_string(path).with_context(|| {
+            format!(
+                "設定ファイル {} を読み込めません。config.example.tomlをコピーして作成してください",
+                path.display()
+            )
+        })?;
+        Self::from_toml_str(&contents, |key| std::env::var(key).ok())
+            .with_context(|| format!("設定ファイル {} の設定が不正です", path.display()))
     }
 
-    /// 通知ファイルは環境変数へ書き込まず、それぞれ独立して解釈する。
-    fn from_sources(
-        get: impl Fn(&str) -> Option<String>,
-        read: impl Fn(&str) -> Result<HashMap<String, String>>,
-    ) -> Result<Self> {
-        Self::from_sources_with_resolver(get, read, canonicalize_notification_path)
-    }
-
-    fn from_sources_with_resolver(
-        get: impl Fn(&str) -> Option<String>,
-        read: impl Fn(&str) -> Result<HashMap<String, String>>,
-        resolve: impl Fn(&str) -> Result<PathBuf>,
-    ) -> Result<Self> {
-        let ws_url =
-            get("P2PQUAKE_WS_URL").unwrap_or_else(|| "wss://api.p2pquake.net/v2/ws".to_string());
-        let webhooks = if let Some(paths) = get("NOTIFICATION_CONFIG_FILES") {
-            let mut seen = HashSet::new();
-            let mut webhooks = Vec::new();
-            for path in paths.split(',').map(str::trim) {
-                ensure!(
-                    !path.is_empty(),
-                    "NOTIFICATION_CONFIG_FILES に空のファイル名があります"
-                );
-                let canonical_path = resolve(path)
-                    .with_context(|| format!("通知設定ファイル {path} のパスを解決できません"))?;
-                ensure!(
-                    seen.insert(canonical_path),
-                    "通知設定ファイルが重複しています: {path}"
-                );
-                let values = read(path)
-                    .with_context(|| format!("通知設定ファイル {path} を読み込めません"))?;
-                webhooks.push(
-                    WebhookConfig::from_lookup(path, |key| values.get(key).cloned())
-                        .with_context(|| format!("通知設定ファイル {path} の設定が不正です"))?,
-                );
+    /// プレビュー用に、Webhook URLを検証せず`main`、または名前順で最初のWebhookの
+    /// タイル設定だけを読む。
+    ///
+    /// 設定ファイルがまだ無い場合は、通知設定を用意していない状態でもプレビューを
+    /// 実行できるよう既定のタイルURLを返す。
+    pub fn tile_url_template_from_file(path: impl AsRef<Path>) -> Result<String> {
+        let path = path.as_ref();
+        let contents = match std::fs::read_to_string(path) {
+            Ok(contents) => contents,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(DEFAULT_TILE_URL_TEMPLATE.to_string())
             }
-            webhooks
-        } else {
-            // ファイル一覧を指定しない場合は、従来どおり .env / 環境変数を使う。
-            vec![WebhookConfig::from_lookup("default", get)?]
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("設定ファイル {} を読み込めません", path.display()))
+            }
         };
+        let raw: TomlConfig = toml::from_str(&contents).context("TOMLの構文が不正です")?;
+        raw.webhooks
+            .get("main")
+            .or_else(|| raw.webhooks.values().next())
+            .map(|webhook| webhook.tile_url_template.clone())
+            .context("webhooksを1つ以上設定してください")
+    }
+
+    fn from_toml_str(contents: &str, get_env: impl Fn(&str) -> Option<String>) -> Result<Self> {
+        let raw: TomlConfig = toml::from_str(contents).context("TOMLの構文が不正です")?;
+        ensure!(
+            !raw.webhooks.is_empty(),
+            "webhooksを1つ以上設定してください"
+        );
+
+        let ws_url = raw
+            .ws_url
+            .or_else(|| get_env("P2PQUAKE_WS_URL"))
+            .unwrap_or_else(|| DEFAULT_WS_URL.to_string());
+        ensure!(!ws_url.trim().is_empty(), "ws_urlは空にできません");
+
+        let mut webhooks = Vec::with_capacity(raw.webhooks.len());
+        for (name, webhook) in raw.webhooks {
+            ensure!(!name.trim().is_empty(), "webhooksの名前は空にできません");
+            webhooks.push(WebhookConfig::from_toml(&name, webhook, &get_env)?);
+        }
+
         Ok(Self { ws_url, webhooks })
     }
 }
 
-fn canonicalize_notification_path(path: &str) -> Result<PathBuf> {
-    std::fs::canonicalize(path).with_context(|| format!("通知設定ファイル {path} が存在しません"))
-}
-
-fn read_notification_file(path: &str) -> Result<HashMap<String, String>> {
-    // dotenvy の変数展開はプロセス環境を参照するため、先に `$` をエスケープする。
-    // 通知設定ファイルはファイル内の値だけで完結させ、起動用環境変数を継承しない。
-    let contents = std::fs::read_to_string(path)
-        .with_context(|| format!("通知設定ファイル {path} を読み込めません"))?;
-    let contents = escape_dollar_expansion(&contents);
-    let entries = dotenvy::from_read_iter(std::io::Cursor::new(contents));
-    let mut values = HashMap::new();
-    for entry in entries {
-        let (key, value) = entry.map_err(|error| sanitize_dotenv_error(path, error))?;
-        values.insert(key, value);
-    }
-    Ok(values)
-}
-
-/// dotenvy の構文を維持したまま、変数展開の記号だけをリテラルにする。
-fn escape_dollar_expansion(contents: &str) -> String {
-    let mut escaped = String::with_capacity(contents.len());
-    let mut single_quote = false;
-    let mut double_quote = false;
-    let mut backslash = false;
-    let mut expecting_end = false;
-    let mut line_start = true;
-    let mut only_whitespace = true;
-    let mut comment = false;
-
-    for character in contents.chars() {
-        if comment {
-            escaped.push(character);
-            if character == '\n' {
-                comment = false;
-                line_start = true;
-                only_whitespace = true;
-                expecting_end = false;
-            }
-            continue;
-        }
-
-        if line_start && !single_quote && !double_quote {
-            if only_whitespace && matches!(character, ' ' | '\t' | '\r') {
-                escaped.push(character);
-                continue;
-            }
-            if only_whitespace && character == '#' {
-                escaped.push(character);
-                comment = true;
-                line_start = false;
-                continue;
-            }
-            line_start = false;
-            only_whitespace = false;
-        }
-
-        if single_quote {
-            escaped.push(character);
-            if character == '\'' {
-                single_quote = false;
-            }
-            continue;
-        }
-        if backslash {
-            escaped.push(character);
-            backslash = false;
-            continue;
-        }
-        if double_quote {
-            if character == '\\' {
-                escaped.push(character);
-                backslash = true;
-            } else if character == '"' {
-                escaped.push(character);
-                double_quote = false;
-            } else if character == '$' {
-                escaped.push('\\');
-                escaped.push('$');
-            } else {
-                escaped.push(character);
-            }
-            continue;
-        }
-
-        if expecting_end {
-            if matches!(character, ' ' | '\t') {
-                escaped.push(character);
-                continue;
-            }
-            if character == '#' {
-                escaped.push(character);
-                comment = true;
-                expecting_end = false;
-                continue;
-            }
-            expecting_end = false;
-        }
-
-        match character {
-            '\\' => {
-                escaped.push(character);
-                backslash = true;
-            }
-            '\'' => {
-                escaped.push(character);
-                single_quote = true;
-            }
-            '"' => {
-                escaped.push(character);
-                double_quote = true;
-            }
-            '$' => {
-                escaped.push('\\');
-                escaped.push('$');
-            }
-            ' ' | '\t' => {
-                escaped.push(character);
-                expecting_end = true;
-            }
-            '\n' => {
-                escaped.push(character);
-                line_start = true;
-                only_whitespace = true;
-                expecting_end = false;
-            }
-            _ => escaped.push(character),
-        }
-    }
-    escaped
-}
-
-fn sanitize_dotenv_error(path: &str, error: dotenvy::Error) -> anyhow::Error {
-    match error {
-        // dotenvy の LineParse は秘密値を含む行全体を保持しているため、表示しない。
-        dotenvy::Error::LineParse(_, position) => {
-            anyhow!("通知設定ファイル {path} の構文エラー（行内位置: {position}）")
-        }
-        dotenvy::Error::Io(error) => {
-            anyhow!("通知設定ファイル {path} の読み込みに失敗しました: {error}")
-        }
-        dotenvy::Error::EnvVar(error) => {
-            anyhow!("通知設定ファイル {path} の環境変数展開に失敗しました: {error}")
-        }
-        _ => anyhow!("通知設定ファイル {path} の読み込みに失敗しました"),
-    }
-}
-
 impl WebhookConfig {
-    fn from_lookup(name: &str, get: impl Fn(&str) -> Option<String>) -> Result<Self> {
-        let webhook_url = get("DISCORD_WEBHOOK_URL")
-            .filter(|v| !v.trim().is_empty())
-            .context("DISCORD_WEBHOOK_URL が未設定または空です")?;
-        let scale = |key: &str| -> Result<Option<i32>> {
-            get(key)
-                .map(|v| {
-                    v.parse::<i32>()
-                        .with_context(|| format!("{key} は整数で指定してください: {v}"))
-                })
-                .transpose()
-        };
-        let mut region_min_scales = HashMap::new();
-        for (region, prefix, _) in REGIONS {
-            if let Some(value) = scale(&format!("{prefix}_MIN_SCALE"))? {
-                region_min_scales.insert(region.to_string(), value);
-            }
+    fn from_toml(
+        name: &str,
+        raw: TomlWebhookConfig,
+        get_env: &impl Fn(&str) -> Option<String>,
+    ) -> Result<Self> {
+        let env_name = raw.webhook_url_env.trim();
+        ensure!(
+            !env_name.is_empty(),
+            "webhooks.{name}.webhook_url_envは必須です"
+        );
+        let webhook_url = get_env(env_name)
+            .filter(|value| !value.trim().is_empty())
+            .with_context(|| {
+                format!("webhooks.{name}が参照する環境変数{env_name}が未設定または空です")
+            })?;
+
+        for region in raw.region_min_scales.keys() {
+            ensure!(
+                REGIONS.iter().any(|(known, _)| *known == region),
+                "webhooks.{name}.region_min_scalesに不明な地方があります: {region}"
+            );
         }
-        let other_min_scale = scale("OTHER_MIN_SCALE")?.unwrap_or(50);
-        let attach_map = get("ATTACH_MAP")
-            .map(|v| !matches!(v.to_lowercase().as_str(), "0" | "false" | "no"))
-            .unwrap_or(true);
-        let tile_url_template = get("TILE_URL_TEMPLATE").unwrap_or_else(|| {
-            "https://cyberjapandata.gsi.go.jp/xyz/blank/{z}/{x}/{y}.png".to_string()
-        });
+
         Ok(Self {
             name: name.to_string(),
             webhook_url,
-            region_min_scales,
-            other_min_scale,
-            attach_map,
-            tile_url_template,
+            watched_points: normalize_watched_points(raw.watched_points)
+                .with_context(|| format!("webhooks.{name}.watched_pointsが不正です"))?,
+            region_min_scales: raw.region_min_scales,
+            other_min_scale: raw.other_min_scale,
+            attach_map: raw.attach_map,
+            tile_url_template: raw.tile_url_template,
         })
     }
+}
+
+/// 情報源の都道府県と地域・観測点名で照合する登録地点。
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct WatchedPoint {
+    pub pref: String,
+    pub name: String,
+    #[serde(default)]
+    pub label: String,
+}
+
+fn normalize_watched_points(mut points: Vec<WatchedPoint>) -> Result<Vec<WatchedPoint>> {
+    for (i, point) in points.iter_mut().enumerate() {
+        point.pref = point.pref.trim().to_string();
+        point.name = point.name.trim().to_string();
+        point.label = point.label.trim().to_string();
+        ensure!(
+            !point.pref.is_empty() && !point.name.is_empty(),
+            "{}番目: prefとnameは必須です",
+            i + 1
+        );
+        for value in [&point.pref, &point.name, &point.label] {
+            ensure!(
+                value.chars().count() <= 100 && !value.chars().any(char::is_control),
+                "{}番目: 各項目は改行なしの100文字以内で指定してください",
+                i + 1
+            );
+        }
+    }
+
+    // 登録順を維持し、まったく同じ設定の重複を除く。
+    let mut unique = Vec::with_capacity(points.len());
+    for point in points {
+        if !unique.contains(&point) {
+            unique.push(point);
+        }
+    }
+    Ok(unique)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::{Component, Path};
 
-    fn lookup(values: &[(&str, &str)], key: &str) -> Option<String> {
-        values
-            .iter()
-            .find(|(k, _)| *k == key)
-            .map(|(_, v)| v.to_string())
-    }
-
-    fn config(env: &[(&str, &str)], files: &[(&str, &[(&str, &str)])]) -> Result<Config> {
-        Config::from_sources_with_resolver(
-            |key| lookup(env, key),
-            |path| {
-                let (_, values) = files
-                    .iter()
-                    .find(|(p, _)| *p == path)
-                    .with_context(|| format!("ファイルがありません: {path}"))?;
-                Ok(values
-                    .iter()
-                    .map(|(k, v)| (k.to_string(), v.to_string()))
-                    .collect())
-            },
-            |path| {
-                let mut normalized = PathBuf::new();
-                for component in Path::new(path).components() {
-                    match component {
-                        Component::CurDir => {}
-                        Component::ParentDir => {
-                            normalized.pop();
-                        }
-                        component => normalized.push(component.as_os_str()),
-                    }
-                }
-                Ok(normalized)
-            },
-        )
+    fn config(contents: &str, env: &[(&str, &str)]) -> Result<Config> {
+        Config::from_toml_str(contents, |key| {
+            env.iter()
+                .find(|(name, _)| *name == key)
+                .map(|(_, value)| value.to_string())
+        })
     }
 
     #[test]
-    fn legacy_settings_remain_compatible() {
+    fn toml_loads_multiple_webhooks_and_keeps_names() {
         let config = config(
-            &[
-                ("DISCORD_WEBHOOK_URL", "https://example.com/legacy"),
-                ("KANTO_MIN_SCALE", "40"),
-                ("ATTACH_MAP", "no"),
-            ],
-            &[],
-        )
-        .unwrap();
-        assert_eq!(config.webhooks.len(), 1);
-        let hook = &config.webhooks[0];
-        assert_eq!(hook.name, "default");
-        assert_eq!(hook.webhook_url, "https://example.com/legacy");
-        assert_eq!(hook.region_min_scales["関東"], 40);
-        assert_eq!(hook.other_min_scale, 50);
-        assert!(!hook.attach_map);
-    }
+            r#"
+ws_url = "ws://localhost/ws"
 
-    #[test]
-    fn complete_notification_settings_are_independent() {
-        let config = config(
+[webhooks.home]
+webhook_url_env = "DISCORD_WEBHOOK_HOME"
+watched_points = [
+  { pref = " 東京都 ", name = "東京都23区", label = " 自宅周辺 " },
+  { pref = "東京都", name = "東京都23区", label = "自宅周辺" },
+]
+other_min_scale = 40
+region_min_scales = { "関東" = 30, "近畿" = 45 }
+tile_url_template = "home-tiles"
+
+[webhooks.office]
+webhook_url_env = "DISCORD_WEBHOOK_OFFICE"
+other_min_scale = 55
+region_min_scales = { "東北" = 50, "関東" = 45 }
+attach_map = false
+"#,
             &[
-                ("NOTIFICATION_CONFIG_FILES", " first.env, second.env "),
-                ("DISCORD_WEBHOOK_URL", "unused"),
-                ("OTHER_MIN_SCALE", "70"),
-                ("KANTO_MIN_SCALE", "70"),
-                ("ATTACH_MAP", "false"),
-                ("P2PQUAKE_WS_URL", "ws://localhost/ws"),
-            ],
-            &[
-                (
-                    "first.env",
-                    &[
-                        ("DISCORD_WEBHOOK_URL", "first"),
-                        ("OTHER_MIN_SCALE", "40"),
-                        ("TOHOKU_MIN_SCALE", "30"),
-                        ("KANTO_MIN_SCALE", "30"),
-                        ("KINKI_MIN_SCALE", "45"),
-                        ("TILE_URL_TEMPLATE", "first-tiles"),
-                    ],
-                ),
-                (
-                    "second.env",
-                    &[
-                        ("DISCORD_WEBHOOK_URL", "second"),
-                        ("OTHER_MIN_SCALE", "55"),
-                        ("TOHOKU_MIN_SCALE", "50"),
-                        ("KANTO_MIN_SCALE", "45"),
-                        ("ATTACH_MAP", "false"),
-                    ],
-                ),
+                ("DISCORD_WEBHOOK_HOME", "https://example.com/home"),
+                ("DISCORD_WEBHOOK_OFFICE", "https://example.com/office"),
             ],
         )
         .unwrap();
+
         assert_eq!(config.ws_url, "ws://localhost/ws");
         assert_eq!(config.webhooks.len(), 2);
-        let first = &config.webhooks[0];
-        let second = &config.webhooks[1];
-        assert_eq!(first.webhook_url, "first");
-        assert_eq!(second.webhook_url, "second");
-        assert_eq!(first.other_min_scale, 40);
-        assert_eq!(second.other_min_scale, 55);
-        assert_eq!(first.region_min_scales["東北"], 30);
-        assert_eq!(first.region_min_scales["関東"], 30);
-        assert_eq!(first.region_min_scales["近畿"], 45);
-        assert_eq!(second.region_min_scales["東北"], 50);
-        assert_eq!(second.region_min_scales["関東"], 45);
-        assert!(!second.region_min_scales.contains_key("近畿"));
-        assert!(first.attach_map);
-        assert!(!second.attach_map);
-        assert_eq!(first.tile_url_template, "first-tiles");
-        assert_ne!(second.tile_url_template, "first-tiles");
+        let home = &config.webhooks[0];
+        let office = &config.webhooks[1];
+        assert_eq!(home.name, "home");
+        assert_eq!(home.webhook_url, "https://example.com/home");
+        assert_eq!(home.watched_points.len(), 1);
+        assert_eq!(home.watched_points[0].label, "自宅周辺");
+        assert_eq!(home.region_min_scales["関東"], 30);
+        assert_eq!(home.other_min_scale, 40);
+        assert_eq!(home.tile_url_template, "home-tiles");
+        assert_eq!(office.name, "office");
+        assert_eq!(office.webhook_url, "https://example.com/office");
+        assert!(!office.attach_map);
+        assert_eq!(office.region_min_scales["東北"], 50);
     }
 
     #[test]
-    fn nationwide_settings_do_not_require_regions_or_inherit_environment() {
+    fn defaults_are_applied() {
         let config = config(
+            r#"
+[webhooks.main]
+webhook_url_env = "DISCORD_WEBHOOK_URL"
+"#,
             &[
-                ("NOTIFICATION_CONFIG_FILES", "one,two"),
-                ("KANTO_MIN_SCALE", "10"),
-                ("OTHER_MIN_SCALE", "70"),
-            ],
-            &[
-                (
-                    "one",
-                    &[("DISCORD_WEBHOOK_URL", "one"), ("OTHER_MIN_SCALE", "40")],
-                ),
-                ("two", &[("DISCORD_WEBHOOK_URL", "two")]),
+                ("P2PQUAKE_WS_URL", "ws://env/ws"),
+                ("DISCORD_WEBHOOK_URL", "url"),
             ],
         )
         .unwrap();
-        assert!(config
-            .webhooks
-            .iter()
-            .all(|hook| hook.region_min_scales.is_empty()));
-        assert_eq!(config.webhooks[0].other_min_scale, 40);
-        assert_eq!(config.webhooks[1].other_min_scale, 50);
+        assert_eq!(config.ws_url, "ws://env/ws");
+        let hook = &config.webhooks[0];
+        assert_eq!(hook.other_min_scale, 50);
+        assert!(hook.attach_map);
+        assert_eq!(hook.tile_url_template, DEFAULT_TILE_URL_TEMPLATE);
+        assert!(hook.watched_points.is_empty());
     }
 
     #[test]
-    fn empty_duplicate_and_missing_files_are_rejected() {
-        for paths in ["", "one,", "one,one", "missing"] {
-            assert!(config(
-                &[("NOTIFICATION_CONFIG_FILES", paths)],
-                &[("one", &[("DISCORD_WEBHOOK_URL", "url")])]
-            )
-            .is_err());
-        }
-    }
-
-    #[test]
-    fn each_file_requires_a_webhook_and_reports_invalid_settings() {
-        let error = config(
+    fn explicit_ws_url_takes_precedence_over_environment() {
+        let config = config(
+            r#"
+ws_url = "ws://toml/ws"
+[webhooks.main]
+webhook_url_env = "DISCORD_WEBHOOK_URL"
+"#,
             &[
-                ("NOTIFICATION_CONFIG_FILES", "one"),
-                ("DISCORD_WEBHOOK_URL", "secret"),
+                ("P2PQUAKE_WS_URL", "ws://env/ws"),
+                ("DISCORD_WEBHOOK_URL", "url"),
             ],
-            &[("one", &[])],
         )
-        .unwrap_err();
-        let message = format!("{error:#}");
-        assert!(message.contains("one"));
-        assert!(message.contains("DISCORD_WEBHOOK_URL"));
-        assert!(!message.contains("secret"));
-        assert!(config(&[("DISCORD_WEBHOOK_URL", " ")], &[]).is_err());
-        let error = config(
-            &[("NOTIFICATION_CONFIG_FILES", "one")],
-            &[(
-                "one",
-                &[("DISCORD_WEBHOOK_URL", "url"), ("OTHER_MIN_SCALE", "bad")],
-            )],
-        )
-        .unwrap_err();
-        assert!(format!("{error:#}").contains("OTHER_MIN_SCALE"));
+        .unwrap();
+        assert_eq!(config.ws_url, "ws://toml/ws");
     }
 
     #[test]
-    fn dotenv_files_keep_existing_keys_and_syntax() {
-        let path =
-            std::env::temp_dir().join(format!("quake-alert-config-{}.env", std::process::id()));
-        std::fs::write(&path, "# 通知設定\nDISCORD_WEBHOOK_URL='https://example.com/hook'\nOTHER_MIN_SCALE=40\nKANTO_MIN_SCALE=30\nATTACH_MAP=false\n").unwrap();
-        let values = read_notification_file(path.to_str().unwrap());
-        std::fs::remove_file(path).unwrap();
-        let values = values.unwrap();
-        let hook = WebhookConfig::from_lookup("file", |key| values.get(key).cloned()).unwrap();
-        assert_eq!(hook.webhook_url, "https://example.com/hook");
-        assert_eq!(hook.other_min_scale, 40);
-        assert_eq!(hook.region_min_scales["関東"], 30);
-        assert!(!hook.attach_map);
-    }
-
-    #[test]
-    fn canonical_path_aliases_are_rejected_as_duplicates() {
-        let root =
-            std::env::temp_dir().join(format!("quake-alert-config-alias-{}", std::process::id()));
-        let nested = root.join("nested");
-        let file = root.join("foo.env");
-        std::fs::create_dir_all(&nested).unwrap();
-        std::fs::write(&file, "DISCORD_WEBHOOK_URL=https://example.com/hook\n").unwrap();
-        let paths = format!("{},{}", file.display(), nested.join("../foo.env").display());
-        let error = Config::from_sources(
-            |key| (key == "NOTIFICATION_CONFIG_FILES").then_some(paths.clone()),
-            read_notification_file,
-        )
-        .unwrap_err();
-        std::fs::remove_dir_all(&root).unwrap();
-        assert!(error.to_string().contains("重複しています"));
-    }
-
-    #[test]
-    fn dotenv_syntax_errors_do_not_include_secret_values() {
-        let path = std::env::temp_dir().join(format!(
-            "quake-alert-config-secret-{}.env",
-            std::process::id()
-        ));
+    fn invalid_settings_are_rejected_without_exposing_secret() {
         let secret = "https://discord.com/api/webhooks/private-secret";
-        std::fs::write(
-            &path,
-            format!("DISCORD_WEBHOOK_URL=\"{secret}\nOTHER_MIN_SCALE=40\n"),
+        let error = config(
+            r#"
+[webhooks.main]
+webhook_url_env = "DISCORD_WEBHOOK_URL"
+region_min_scales = { "関東圏" = 40 }
+"#,
+            &[("DISCORD_WEBHOOK_URL", secret)],
         )
-        .unwrap();
-        let error = read_notification_file(path.to_str().unwrap()).unwrap_err();
-        std::fs::remove_file(&path).unwrap();
-        let message = format!("{error:#}");
-        assert!(message.contains("構文エラー"));
-        assert!(message.contains("行内位置"));
-        assert!(message.contains(path.to_str().unwrap()));
-        assert!(!message.contains(secret));
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("不明な地方"));
+        assert!(!format!("{error:#}").contains(secret));
+
+        assert!(config(
+            "[webhooks.main]\nwebhook_url_env = \"DISCORD_WEBHOOK_URL\"\n",
+            &[],
+        )
+        .is_err());
+        assert!(config("", &[]).is_err());
+        assert!(config("[webhooks]\n", &[]).is_err());
     }
 
     #[test]
-    fn dotenv_values_do_not_expand_process_environment() {
+    fn watched_points_are_deduplicated_and_validated() {
+        let loaded = config(
+            r#"
+[webhooks.main]
+webhook_url_env = "DISCORD_WEBHOOK_URL"
+watched_points = [
+  { pref = "東京都", name = "東京都23区", label = "自宅" },
+  { pref = "東京都", name = "東京都23区", label = "自宅" },
+]
+"#,
+            &[("DISCORD_WEBHOOK_URL", "url")],
+        )
+        .unwrap();
+        assert_eq!(loaded.webhooks[0].watched_points.len(), 1);
+        assert!(config(
+            r#"
+[webhooks.main]
+webhook_url_env = "DISCORD_WEBHOOK_URL"
+watched_points = [{ pref = " ", name = "東京都23区" }]
+"#,
+            &[("DISCORD_WEBHOOK_URL", "url")],
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn unknown_toml_fields_are_rejected() {
+        let error = config(
+            r#"
+[webhooks.main]
+webhook_url_env = "DISCORD_WEBHOOK_URL"
+watched_point = []
+"#,
+            &[("DISCORD_WEBHOOK_URL", "url")],
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("TOMLの構文が不正です"));
+    }
+
+    #[test]
+    fn example_config_is_valid() {
+        let contents = include_str!("../config.example.toml");
+        let config = Config::from_toml_str(contents, |key| {
+            (key == "DISCORD_WEBHOOK_URL").then(|| "https://example.com/hook".to_string())
+        })
+        .unwrap();
+        assert_eq!(config.webhooks.len(), 1);
+        assert_eq!(config.webhooks[0].name, "main");
+    }
+
+    #[test]
+    fn preview_tile_setting_does_not_require_webhook_secret() {
         let path = std::env::temp_dir().join(format!(
-            "quake-alert-config-expansion-{}.env",
+            "quake-alert-preview-config-{}.toml",
             std::process::id()
         ));
         std::fs::write(
             &path,
-            "# don't expand variables\nDISCORD_WEBHOOK_URL=$HOME\n# a \"comment\"\nTILE_URL_TEMPLATE='$HOME'\n",
+            r#"
+[webhooks.main]
+webhook_url_env = "DISCORD_WEBHOOK_URL"
+tile_url_template = "preview-tiles"
+"#,
         )
         .unwrap();
-        let values = read_notification_file(path.to_str().unwrap()).unwrap();
-        std::fs::remove_file(&path).unwrap();
-        assert_eq!(values["DISCORD_WEBHOOK_URL"], "$HOME");
-        assert_eq!(values["TILE_URL_TEMPLATE"], "$HOME");
+        let tile_url = Config::tile_url_template_from_file(&path).unwrap();
+        std::fs::remove_file(path).unwrap();
+        assert_eq!(tile_url, "preview-tiles");
     }
 }

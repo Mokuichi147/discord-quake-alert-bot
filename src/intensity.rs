@@ -4,32 +4,53 @@ use std::collections::HashMap;
 
 use crate::model::{Earthquake, EewArea, Point};
 
-/// 地方区分。`(地方名, 環境変数の接頭辞, 含む都道府県の正規化形)`。
+/// 地方区分。`(地方名, 含む都道府県の正規化形)`。
 ///
 /// 正規化形は末尾の「都/府/県」を除いた表記（北海道は「道」を残す）。これにより
 /// 551 の `points.pref`（"東京都"）と 556 の `areas.pref`（"東京"）の両方を同一キーで扱える。
-pub const REGIONS: &[(&str, &str, &[&str])] = &[
-    ("北海道", "HOKKAIDO", &["北海道"]),
-    ("東北", "TOHOKU", &["青森", "岩手", "宮城", "秋田", "山形", "福島"]),
-    ("関東", "KANTO", &["茨城", "栃木", "群馬", "埼玉", "千葉", "東京", "神奈川"]),
+pub const REGIONS: &[(&str, &[&str])] = &[
+    ("北海道", &["北海道"]),
+    ("東北", &["青森", "岩手", "宮城", "秋田", "山形", "福島"]),
+    (
+        "関東",
+        &["茨城", "栃木", "群馬", "埼玉", "千葉", "東京", "神奈川"],
+    ),
     (
         "中部",
-        "CHUBU",
-        &["新潟", "富山", "石川", "福井", "山梨", "長野", "岐阜", "静岡", "愛知"],
+        &[
+            "新潟", "富山", "石川", "福井", "山梨", "長野", "岐阜", "静岡", "愛知",
+        ],
     ),
-    ("近畿", "KINKI", &["三重", "滋賀", "京都", "大阪", "兵庫", "奈良", "和歌山"]),
-    ("中国", "CHUGOKU", &["鳥取", "島根", "岡山", "広島", "山口"]),
-    ("四国", "SHIKOKU", &["徳島", "香川", "愛媛", "高知"]),
+    (
+        "近畿",
+        &["三重", "滋賀", "京都", "大阪", "兵庫", "奈良", "和歌山"],
+    ),
+    ("中国", &["鳥取", "島根", "岡山", "広島", "山口"]),
+    ("四国", &["徳島", "香川", "愛媛", "高知"]),
     (
         "九州",
-        "KYUSHU",
-        &["福岡", "佐賀", "長崎", "熊本", "大分", "宮崎", "鹿児島", "沖縄"],
+        &[
+            "福岡",
+            "佐賀",
+            "長崎",
+            "熊本",
+            "大分",
+            "宮崎",
+            "鹿児島",
+            "沖縄",
+        ],
     ),
 ];
 
 /// 都道府県名を正規化する。末尾の「都/府/県」を除く（「道」は残す）。
-/// 例: "東京都"→"東京", "大阪府"→"大阪", "北海道"→"北海道", "東京"→"東京"。
+/// 北海道の予報区名（「北海道道北」など）は親都道府県へ畳み込む。
+/// 例: "東京都"→"東京", "大阪府"→"大阪", "北海道道北"→"北海道"。
 pub fn normalize_pref(pref: &str) -> &str {
+    if let Some(area) = pref.strip_prefix("北海道") {
+        if area.starts_with('道') {
+            return "北海道";
+        }
+    }
     pref.strip_suffix('都')
         .or_else(|| pref.strip_suffix('府'))
         .or_else(|| pref.strip_suffix('県'))
@@ -41,8 +62,8 @@ pub fn region_of(pref: &str) -> Option<&'static str> {
     let np = normalize_pref(pref);
     REGIONS
         .iter()
-        .find(|(_, _, prefs)| prefs.contains(&np))
-        .map(|(name, _, _)| *name)
+        .find(|(_, prefs)| prefs.contains(&np))
+        .map(|(name, _)| *name)
 }
 
 /// 地方の通知下限を返す。設定がなければ `other_min_scale` にフォールバックする。
@@ -376,6 +397,7 @@ mod tests {
         Point {
             pref: pref.to_string(),
             addr: String::new(),
+            is_area: false,
             scale,
         }
     }
@@ -390,8 +412,10 @@ mod tests {
         assert_eq!(normalize_pref("東京都"), "東京");
         assert_eq!(normalize_pref("大阪府"), "大阪");
         assert_eq!(normalize_pref("北海道"), "北海道");
+        assert_eq!(normalize_pref("北海道道北"), "北海道");
         assert_eq!(normalize_pref("東京"), "東京");
         assert_eq!(region_of("東京都"), Some("関東"));
+        assert_eq!(region_of("北海道道北"), Some("北海道"));
         assert_eq!(region_of("宮城"), Some("東北"));
         assert_eq!(region_of("大阪府"), Some("近畿"));
         assert_eq!(region_of("ハワイ"), None);
@@ -542,7 +566,12 @@ mod tests {
     fn eew_reason_lists_prefs_at_max_scale() {
         // 複数県が同じ予想最大震度の場合は、その県名を列挙する（地方名にまとめない）。
         let scales = HashMap::from([("東北".to_string(), 40)]);
-        let areas = vec![area("青森", 45), area("岩手", 45), area("岩手", 40), area("宮城", 30)];
+        let areas = vec![
+            area("青森", 45),
+            area("岩手", 45),
+            area("岩手", 40),
+            area("宮城", 30),
+        ];
         let d = decide_eew(&areas, &scales, 50);
         assert!(d.notify);
         assert_eq!(d.reason, "青森県・岩手県で予想最大震度5弱");
