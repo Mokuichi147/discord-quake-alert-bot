@@ -3,8 +3,8 @@
 use std::collections::BTreeMap;
 use std::env;
 use std::fs;
-use std::path::PathBuf;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, bail, Context, Result};
 use serde_json::Value;
@@ -12,6 +12,7 @@ use sha2::{Digest, Sha256};
 
 const SOURCE: &str = "https://ds.data.jma.go.jp/eqev/data/intens-st/stations.json";
 const DEFAULT_OUTPUT: &str = "src/data/observation_stations.tsv";
+const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 const PREFS: &[&str] = &[
     "北海道",
     "青森県",
@@ -184,6 +185,55 @@ fn utc_date() -> String {
     format!("{year:04}-{month:02}-{day:02}")
 }
 
+fn temporary_path(output: &Path) -> PathBuf {
+    let mut temporary = output.as_os_str().to_os_string();
+    temporary.push(".tmp");
+    PathBuf::from(temporary)
+}
+
+#[cfg(not(windows))]
+fn replace_output(temporary: &Path, output: &Path) -> Result<()> {
+    fs::rename(temporary, output)
+        .with_context(|| format!("生成したTSVを置き換えられません: {}", output.display()))?;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn replace_output(temporary: &Path, output: &Path) -> Result<()> {
+    // Windowsのrenameは既存ファイルを上書きしないため、既存TSVを一時退避してから
+    // 生成物を移動する。2回目のrenameに失敗した場合は、元のTSVを復元する。
+    if !output.exists() {
+        fs::rename(temporary, output)
+            .with_context(|| format!("生成したTSVを置き換えられません: {}", output.display()))?;
+        return Ok(());
+    }
+
+    let mut backup = output.as_os_str().to_os_string();
+    backup.push(".bak");
+    let backup = PathBuf::from(backup);
+    if backup.exists() {
+        fs::remove_file(&backup)
+            .with_context(|| format!("既存のバックアップを削除できません: {}", backup.display()))?;
+    }
+    fs::rename(output, &backup)
+        .with_context(|| format!("既存のTSVを退避できません: {}", output.display()))?;
+
+    match fs::rename(temporary, output) {
+        Ok(()) => {
+            let _ = fs::remove_file(&backup);
+            Ok(())
+        }
+        Err(error) => match fs::rename(&backup, output) {
+            Ok(()) => Err(error).with_context(|| {
+                format!("生成したTSVを置き換えられません: {}", output.display())
+            }),
+            Err(restore_error) => Err(anyhow!(
+                "生成したTSVを置き換えられず、既存TSVの復元にも失敗しました: 置換={error}; 復元={restore_error}"
+            )),
+        },
+    }
+}
+
 fn print_help() {
     println!(
         "使い方: cargo run --bin update_observation_stations -- [--input JSON] [--output TSV]\n"
@@ -230,6 +280,7 @@ async fn main() -> Result<()> {
     } else {
         reqwest::Client::builder()
             .user_agent("quake-alert-bot-observation-stations/1")
+            .timeout(HTTP_TIMEOUT)
             .build()?
             .get(SOURCE)
             .send()
@@ -252,11 +303,10 @@ async fn main() -> Result<()> {
         lines.len()
     );
     let contents = format!("{header}{}\n", lines.join("\n"));
-    let temporary = output.with_extension("tmp");
+    let temporary = temporary_path(&output);
     fs::write(&temporary, contents)
         .with_context(|| format!("一時TSVを書き込めません: {}", temporary.display()))?;
-    fs::rename(&temporary, &output)
-        .with_context(|| format!("生成したTSVを置き換えられません: {}", output.display()))?;
+    replace_output(&temporary, &output)?;
     println!("{}地点を保存しました: {}", lines.len(), output.display());
     Ok(())
 }
@@ -322,5 +372,28 @@ mod tests {
         assert_eq!(rows.len(), 2);
         assert!(rows[0].starts_with("北海道\t"));
         assert!(rows[1].starts_with("青森県\t"));
+    }
+
+    #[test]
+    fn replaces_existing_output_file() {
+        let directory = env::temp_dir().join(format!(
+            "quake-alert-bot-update-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&directory).unwrap();
+        let output = directory.join("stations.tsv");
+        let temporary = temporary_path(&output);
+        fs::write(&output, "old\n").unwrap();
+        fs::write(&temporary, "new\n").unwrap();
+
+        replace_output(&temporary, &output).unwrap();
+
+        assert_eq!(fs::read_to_string(&output).unwrap(), "new\n");
+        assert!(!temporary.exists());
+        fs::remove_dir_all(directory).unwrap();
     }
 }
