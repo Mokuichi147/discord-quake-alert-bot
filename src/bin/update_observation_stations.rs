@@ -6,6 +6,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+#[cfg(windows)]
+use std::io::ErrorKind;
+
 use anyhow::{anyhow, bail, Context, Result};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -199,6 +202,29 @@ fn replace_output(temporary: &Path, output: &Path) -> Result<()> {
 }
 
 #[cfg(windows)]
+fn move_existing_output(output: &Path) -> Result<PathBuf> {
+    // 既存のバックアップを削除せず、今回の実行専用の名前へ退避する。
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    for attempt in 0..100 {
+        let mut backup = output.as_os_str().to_os_string();
+        backup.push(format!(".bak.{}.{}.{attempt}", std::process::id(), nonce));
+        let backup = PathBuf::from(backup);
+        match fs::rename(output, &backup) {
+            Ok(()) => return Ok(backup),
+            Err(error) if error.kind() == ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("既存のTSVを退避できません: {}", output.display()))
+            }
+        }
+    }
+    bail!("TSVの退避先を確保できません: {}", output.display());
+}
+
+#[cfg(windows)]
 fn replace_output(temporary: &Path, output: &Path) -> Result<()> {
     // Windowsのrenameは既存ファイルを上書きしないため、既存TSVを一時退避してから
     // 生成物を移動する。2回目のrenameに失敗した場合は、元のTSVを復元する。
@@ -208,15 +234,7 @@ fn replace_output(temporary: &Path, output: &Path) -> Result<()> {
         return Ok(());
     }
 
-    let mut backup = output.as_os_str().to_os_string();
-    backup.push(".bak");
-    let backup = PathBuf::from(backup);
-    if backup.exists() {
-        fs::remove_file(&backup)
-            .with_context(|| format!("既存のバックアップを削除できません: {}", backup.display()))?;
-    }
-    fs::rename(output, &backup)
-        .with_context(|| format!("既存のTSVを退避できません: {}", output.display()))?;
+    let backup = move_existing_output(output)?;
 
     match fs::rename(temporary, output) {
         Ok(()) => {
@@ -387,13 +405,16 @@ mod tests {
         fs::create_dir_all(&directory).unwrap();
         let output = directory.join("stations.tsv");
         let temporary = temporary_path(&output);
+        let existing_backup = output.with_extension("bak");
         fs::write(&output, "old\n").unwrap();
+        fs::write(&existing_backup, "keep\n").unwrap();
         fs::write(&temporary, "new\n").unwrap();
 
         replace_output(&temporary, &output).unwrap();
 
         assert_eq!(fs::read_to_string(&output).unwrap(), "new\n");
         assert!(!temporary.exists());
+        assert_eq!(fs::read_to_string(existing_backup).unwrap(), "keep\n");
         fs::remove_dir_all(directory).unwrap();
     }
 }
