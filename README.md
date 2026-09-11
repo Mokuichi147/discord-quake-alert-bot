@@ -14,21 +14,21 @@
 この条件は 551 の観測震度・556 の予想震度の**両方**に適用されます。
 
 - いずれかの地点（地域）の震度が、その地点の属する**地方の下限**以上 → 通知
-- 地方ごとの下限は環境変数で設定でき、**未設定の地方は `OTHER_MIN_SCALE`（既定 50 = 震度5強）にフォールバック**します。
-- 既定ではどの地方も特別扱いせず `OTHER_MIN_SCALE` 相当です。例えば関東・近畿を震度4で通知したい場合は `KANTO_MIN_SCALE=40` `KINKI_MIN_SCALE=40` を設定します。
+- 地方ごとの下限は各Webhookの`region_min_scales`で設定でき、**未設定の地方は `other_min_scale`（既定 50 = 震度5強）にフォールバック**します。
+- 既定ではどの地方も特別扱いせず `other_min_scale` 相当です。例えば関東・近畿を震度4で通知したい場合は`region_min_scales = { "関東" = 40, "近畿" = 40 }`を設定します。
 
-### 地方区分と環境変数
+### 地方区分とTOMLの地方名
 
-| 地方 | 環境変数 | 既定 |
+| 地方 | `region_min_scales`のキー | 既定 |
 | --- | --- | --- |
-| 北海道 | `HOKKAIDO_MIN_SCALE` | 未設定→`OTHER_MIN_SCALE` |
-| 東北 | `TOHOKU_MIN_SCALE` | 未設定→`OTHER_MIN_SCALE` |
-| 関東 | `KANTO_MIN_SCALE` | 未設定→`OTHER_MIN_SCALE` |
-| 中部 | `CHUBU_MIN_SCALE` | 未設定→`OTHER_MIN_SCALE` |
-| 近畿 | `KINKI_MIN_SCALE` | 未設定→`OTHER_MIN_SCALE` |
-| 中国 | `CHUGOKU_MIN_SCALE` | 未設定→`OTHER_MIN_SCALE` |
-| 四国 | `SHIKOKU_MIN_SCALE` | 未設定→`OTHER_MIN_SCALE` |
-| 九州（沖縄含む） | `KYUSHU_MIN_SCALE` | 未設定→`OTHER_MIN_SCALE` |
+| 北海道 | `"北海道"` | 未設定→`other_min_scale` |
+| 東北 | `"東北"` | 未設定→`other_min_scale` |
+| 関東 | `"関東"` | 未設定→`other_min_scale` |
+| 中部 | `"中部"` | 未設定→`other_min_scale` |
+| 近畿 | `"近畿"` | 未設定→`other_min_scale` |
+| 中国 | `"中国"` | 未設定→`other_min_scale` |
+| 四国 | `"四国"` | 未設定→`other_min_scale` |
+| 九州（沖縄含む） | `"九州"` | 未設定→`other_min_scale` |
 
 震度スケール値: `10`=1, `20`=2, `30`=3, `40`=4, `45`=5弱, `50`=5強, `55`=6弱, `60`=6強, `70`=7。
 
@@ -38,11 +38,12 @@
 
 1. Rust（stable）をインストール: https://rustup.rs/
 2. Discord でチャンネルの Webhook URL を発行（サーバー設定 → 連携サービス → ウェブフック）。
-3. 設定ファイルを用意:
+3. TOMLと秘密値の環境ファイルを用意:
 
    ```sh
    cp .env.example .env
-   # .env を編集して DISCORD_WEBHOOK_URL を設定
+   cp config.example.toml config.toml
+   # .env のWebhook URLと、config.tomlの通知条件・登録地点を編集
    ```
 
 ## ビルドと実行
@@ -74,78 +75,71 @@ cargo run -- preview-map [出力先] --richest  # 履歴内で観測地点が最
 ```
 
 出力先を省略すると、システムの一時ディレクトリに `quake-alert-bot-preview.webp` を保存します。`--richest` を付けると、最新報ではなく履歴内で観測地点が最も多い報を選びます。地図タイルと履歴 API へのアクセスは行いますが、Discord Webhook には送信しません。
+地図タイルは`main`Webhookがあればその`tile_url_template`、無ければ名前順で最初のWebhookの値を使います。設定ファイルが無い場合は既定の地理院タイルを使います。
 
-## 設定（環境変数）
+## 設定
 
-| 変数 | 既定値 | 説明 |
+通知設定は`config.toml`にまとめます。Webhook URLだけは設定ファイルへ書かず、`.env`またはOSの環境変数に置きます。`config.toml`は起動時の作業ディレクトリから読み込みます。別の場所を使う場合は`QUAKE_ALERT_CONFIG`または`--config`で指定できます。
+
+| 設定 | 既定値 | 説明 |
 | --- | --- | --- |
-| `DISCORD_WEBHOOK_URL` | （必須） | 各通知設定の Discord Webhook URL |
-| `NOTIFICATION_CONFIG_FILES` | 未設定 | 独立した通知設定ファイルのパスをカンマ区切りで指定。未設定なら従来の単一設定で動作 |
-| `WATCHED_POINTS` | `[]` | このWebhookで強調表示する地点のJSON配列（下記参照） |
-| `<地方>_MIN_SCALE` | 未設定 | 地方ごとの通知する最小震度スケール（未設定は `OTHER_MIN_SCALE`。上記「地方区分と環境変数」を参照） |
-| `OTHER_MIN_SCALE` | `50` | 下限が未設定の地方・地域で通知する最小震度スケール |
-| `ATTACH_MAP` | `true` | 地図画像を添付するか |
-| `TILE_URL_TEMPLATE` | 地理院タイル(白地図 blank) | 地図タイルの URL テンプレート |
-| `P2PQUAKE_WS_URL` | `wss://api.p2pquake.net/v2/ws` | WebSocket エンドポイント |
-| `RUST_LOG` | `info` | ログレベル |
+| `ws_url` | `P2PQUAKE_WS_URL`、それも無ければ公式URL | WebSocketエンドポイント |
+| `[webhooks.<name>]` | 1つ以上必須 | 送信先ごとの設定。`<name>`はログに表示する識別名 |
+| `webhook_url_env` | 必須 | Webhook URLを格納した環境変数の名前 |
+| `watched_points` | `[]` | このWebhookで強調表示する地点のTOML配列 |
+| `region_min_scales` | `{}` | 地方名から最小震度スケールへのマップ |
+| `other_min_scale` | `50` | 地方別設定が無い地域の最小震度スケール |
+| `attach_map` | `true` | 地図画像を添付するか |
+| `tile_url_template` | 地理院タイル(白地図 blank) | 地図タイルのURLテンプレート |
 
-`.env` が無い場合は OS の環境変数を参照します。
+ログレベルだけは`RUST_LOG`環境変数で設定します。`P2PQUAKE_WS_URL`はTOMLの`ws_url`を省略した場合の互換用です。
 
-### 従来の通知設定を複数使う
+### 複数のWebhookを登録する
 
-従来の「Webhook URL・登録地点・全国のしきい値・地方別のしきい値・地図設定」を1組として、通知設定ファイルを複数用意できます。すべての設定に同じ受信情報を渡し、それぞれの条件と登録地点で通知します。bot は1プロセスで起動し、WebSocket 接続は1つを共有します。
+`config.toml`の`[webhooks.<name>]`を増やすと、同じWebSocket接続で複数のWebhookへ配信できます。通知条件・登録地点・地図設定・再送状態は送信先ごとに独立します。`--test`系も設定済みのすべてのWebhookへ送信します。
 
-1. 通知設定の雛形を必要な数だけ複製します。既存の `.env` の通知設定をコピーしても使えます。
+```toml
+[webhooks.home]
+webhook_url_env = "DISCORD_WEBHOOK_HOME"
+other_min_scale = 40
+watched_points = [
+  { pref = "東京都", name = "東京都23区", label = "自宅周辺" },
+]
 
-   ```sh
-   cp .env.notification.example .env.notification-1
-   cp .env.notification.example .env.notification-2
-   ```
+[webhooks.office]
+webhook_url_env = "DISCORD_WEBHOOK_OFFICE"
+other_min_scale = 50
+region_min_scales = { "近畿" = 40 }
+attach_map = false
+```
 
-2. 各ファイルに、従来と同じキー名で独立した通知設定を記述します。
-
-   `.env.notification-1` の例（全国で震度4以上を通知）:
-
-   ```dotenv
-   DISCORD_WEBHOOK_URL=https://discord.com/api/webhooks/xxxxxxxx/yyyyyyyy
-   OTHER_MIN_SCALE=40
-   ATTACH_MAP=true
-   ```
-
-   `.env.notification-2` の例（全国で震度5強以上、東北・関東・近畿は震度4以上を通知）:
-
-   ```dotenv
-   DISCORD_WEBHOOK_URL=https://discord.com/api/webhooks/aaaaaaaa/bbbbbbbb
-   OTHER_MIN_SCALE=50
-   TOHOKU_MIN_SCALE=40
-   KANTO_MIN_SCALE=40
-   KINKI_MIN_SCALE=40
-   ATTACH_MAP=false
-   ```
-
-   各ファイルで、登録地点、北海道から九州まで全地方のしきい値、`TILE_URL_TEMPLATE` を自由に指定できます。未指定の地方は、そのファイルの `OTHER_MIN_SCALE` に従います。津波予報は各設定のWebhookへ通知します。
-
-3. 起動用の `.env` に、読み込む通知設定ファイルを列挙します。
-
-   ```dotenv
-   NOTIFICATION_CONFIG_FILES=.env.notification-1,.env.notification-2
-   P2PQUAKE_WS_URL=wss://api.p2pquake.net/v2/ws
-   RUST_LOG=info
-   ```
-
-4. `cargo run --release` で1プロセスだけ起動します。
-
-ファイルの相対パスは起動時の作業ディレクトリ基準です。`NOTIFICATION_CONFIG_FILES` 設定時は、通知設定を各ファイルだけから読み込み、起動用 `.env`・OS の環境変数・他の通知設定からは継承しません。設定ファイル内の `$VAR` も環境変数展開せず、文字列として扱います。省略した値には従来の既定値を使います。`P2PQUAKE_WS_URL` と `RUST_LOG` は起動用 `.env` / 環境変数だけで指定します。
-
-`NOTIFICATION_CONFIG_FILES` を省略すると、従来どおり `.env` / 環境変数にある1組の通知設定を使います。空の一覧・重複したパス・読み込めないファイル・Webhook URL の未設定は起動時にエラーになります。
-
-通知条件・待ち行列・重複抑制・続報の編集先・再送状態は設定ごとに独立します。再接続や失敗時の履歴取得は種別ごとに1回だけ行い、各設定の処理状況に応じて拾い直します。`--test` 系のコマンドは、設定済みの**すべてのWebhook**にそれぞれの条件で実通知します。ログの `webhook` の `name` に通知設定ファイル名を表示します。
-### 登録地点の震度を強調表示する
-
-各Webhook用の環境設定（単一設定では `.env`、複数設定では各通知設定ファイル）で `WATCHED_POINTS` に複数の地点を登録できます。
+対応する`.env`は次のようにします。
 
 ```dotenv
-WATCHED_POINTS='[{"pref":"東京都","name":"東京都23区","label":"自宅周辺"},{"pref":"神奈川県","name":"神奈川県東部","label":"職場周辺"}]'
+DISCORD_WEBHOOK_HOME=https://discord.com/api/webhooks/xxxxxxxx/yyyyyyyy
+DISCORD_WEBHOOK_OFFICE=https://discord.com/api/webhooks/aaaaaaaa/bbbbbbbb
+RUST_LOG=info
+```
+
+テーブル名`home`・`office`は識別用で、通知内容の宛先判定には使いません。Webhook URLの環境変数が未設定または空の場合、起動時にエラーになります。
+
+起動時に別の設定ファイルを指定する例:
+
+```sh
+cargo run --release -- --config /etc/quake-alert-bot/config.toml
+# または
+QUAKE_ALERT_CONFIG=/etc/quake-alert-bot/config.toml cargo run --release
+```
+
+### 登録地点の震度を強調表示する
+
+各Webhookの`watched_points`に複数の地点を登録できます。
+
+```toml
+watched_points = [
+  { pref = "東京都", name = "東京都23区", label = "自宅周辺" },
+  { pref = "神奈川県", name = "神奈川県東部", label = "職場周辺" },
+]
 ```
 
 - `pref`：都道府県名（必須。「東京都」と「東京」などの接尾辞の違いは吸収）。556の予報区が「北海道道北」「北海道道東」などの場合も、登録側は`北海道`を指定します。
@@ -170,10 +164,12 @@ P2P地震情報の公式仕様でも、551の`points.addr`は `isArea=false` な
 cargo run -- search-point "千代田区"
 ```
 
-出力は`pref`と情報源の`points.addr`と同じ観測点名の2列です。候補は省略せず順位順にすべて表示します。候補が多い場合だけ、`--limit N`を明示して表示件数を絞れます。例えば次のように、候補の1列目と2列目をそのまま`WATCHED_POINTS`へ登録します。
+出力は`pref`と情報源の`points.addr`と同じ観測点名の2列です。候補は省略せず順位順にすべて表示します。候補が多い場合だけ、`--limit N`を明示して表示件数を絞れます。例えば次のように、候補の1列目と2列目をそのまま`watched_points`へ登録します。
 
-```dotenv
-WATCHED_POINTS='[{"pref":"東京都","name":"東京千代田区大手町","label":"指定地点"}]'
+```toml
+watched_points = [
+  { pref = "東京都", name = "東京千代田区大手町", label = "指定地点" },
+]
 ```
 
 文字列検索の候補は観測点名なので、震度速報・緊急地震速報の区域名は含まれません。区域名を登録する場合は、551履歴の`points.addr`または556の`areas.name`を確認して、情報源の文字列をそのまま指定してください。検索はWebhookや外部APIを使わず、[気象庁の観測点マップ](https://ds.data.jma.go.jp/eqev/data/intens-st/)を加工した同梱TSVだけを参照します。
@@ -183,7 +179,7 @@ WATCHED_POINTS='[{"pref":"東京都","name":"東京千代田区大手町","label
 ```
 src/
   main.rs       … エントリポイント。WebSocket購読・再接続・通知の制御
-  config.rs     … 環境変数の読み込み
+  config.rs     … TOML設定とWebhook URL環境変数の読み込み
   model.rs      … P2P地震情報 API のレスポンス型(serde)
   intensity.rs  … 震度変換・通知条件の判定（単体テストあり）
   geo.rs        … 観測点(市区町村)・都道府県の座標テーブルとマーカー変換
@@ -218,8 +214,8 @@ src/
 ## 注意事項
 
 - **出典の表示（二次利用規約の遵守）**: 地震・津波データは気象庁発表（CC BY 4.0、[P2P地震情報](https://www.p2pquake.net/)経由）です。[P2P地震情報の二次利用規約](https://www.p2pquake.net/secondary_use/)に従い、本botはすべての通知のフッターに「出典: 気象庁」を明記します（地図添付時は「地理院タイル」も併記）。商用・非商用問わず利用できますが、情報の正確性は保証されません。
-- **地図タイルの利用規約**: 既定は国土地理院の白地図(blank、日本全国・zoom 5〜14)タイルです。利用にあたっては出典「地理院タイル」の表示が必要で、本botは地図添付時に通知へ出典と[地理院タイル一覧ページ](https://maps.gsi.go.jp/development/ichiran.html)へのリンクを明記します。高頻度・大量利用の場合は[地理院タイルの利用規約](https://maps.gsi.go.jp/development/ichiran.html)を確認してください。OpenStreetMap など別のタイルへ差し替える場合は `TILE_URL_TEMPLATE` に `{z}/{x}/{y}` 形式の URL を設定します（例: `https://tile.openstreetmap.org/{z}/{x}/{y}.png`。OSM 公式タイルは[利用ポリシー](https://operations.osmfoundation.org/policies/tiles/)に注意）。
-- **WebSocket には IP アドレスごとの接続数制限があります。** [公式仕様](https://www.p2pquake.net/develop/json_api_v2/)では `/ws: 2 接続 (IP アドレス毎)` ですが、実測では2本目の握手がすぐ `429 Too Many Requests` になり、切断したセッションが解放されるまでにも十数秒かかりました。複数のWebhookへ配信する場合は、上記の `NOTIFICATION_CONFIG_FILES` を使って1プロセス・1接続で運用してください。再起動の直後にしばらく 429 が続くのもこのためで、bot 側は10秒間隔で張り直します（テストモード `--test` 系は REST API のみを使うため、この制限には関係しません）。
+- **地図タイルの利用規約**: 既定は国土地理院の白地図(blank、日本全国・zoom 5〜14)タイルです。利用にあたっては出典「地理院タイル」の表示が必要で、本botは地図添付時に通知へ出典と[地理院タイル一覧ページ](https://maps.gsi.go.jp/development/ichiran.html)へのリンクを明記します。高頻度・大量利用の場合は[地理院タイルの利用規約](https://maps.gsi.go.jp/development/ichiran.html)を確認してください。OpenStreetMap など別のタイルへ差し替える場合は各Webhookの`tile_url_template`に`{z}/{x}/{y}`形式のURLを設定します（例: `https://tile.openstreetmap.org/{z}/{x}/{y}.png`。OSM公式タイルは[利用ポリシー](https://operations.osmfoundation.org/policies/tiles/)に注意）。
+- **WebSocket には IP アドレスごとの接続数制限があります。** [公式仕様](https://www.p2pquake.net/develop/json_api_v2/)では `/ws: 2 接続 (IP アドレス毎)` ですが、実測では2本目の握手がすぐ `429 Too Many Requests` になり、切断したセッションが解放されるまでにも十数秒かかりました。複数のWebhookへ配信する場合は、`config.toml`に複数の`[webhooks.<name>]`を設定して1プロセス・1接続で運用してください。再起動の直後にしばらく 429 が続くのもこのためで、bot 側は10秒間隔で張り直します（テストモード `--test` 系は REST API のみを使うため、この制限には関係しません）。
 - P2P地震情報は気象庁発表をもとにした第三者サービスです。緊急地震速報（予報・警報）そのものではなく、揺れの「予想/観測」情報を扱います。重大用途には公式情報源も併用してください。
 - 震源座標が不明な情報（`latitude`/`longitude` が無効値）では地図を添付せずテキストのみで通知します。
 - **各地の震度マーカーの精度**: 気象庁の[公開観測点マップ](https://ds.data.jma.go.jp/eqev/data/intens-st/)の座標を利用し、気象庁・地方公共団体・防災科学技術研究所の4,368地点を収録しています。都道府県と観測点名が一致する地点を個別に描画します。公開JSONの座標は小数点以下2桁（約1km単位）なので、施設内の震度計の厳密な位置を示すものではありません。未収録の観測点・震度速報や緊急地震速報の地域名は、従来どおり都道府県代表座標へ集約します。座標はビルド時に組み込み、通知時の外部取得は不要です。出典・利用条件・更新手順は [座標データの説明](src/data/README.md) を参照してください。

@@ -1,0 +1,46 @@
+# 地震botの通知設定。
+# 構造化された値はこのTOMLに置き、Webhook URLそのものは.envの環境変数に置きます。
+# 起動時は config.toml を読み込みます。
+
+# 省略時は P2PQUAKE_WS_URL、さらに未設定なら公式の既定値を使います。
+ws_url = "wss://api.p2pquake.net/v2/ws"
+
+# テーブル名（main / home / office）はログに表示する識別名です。
+# webhook_url_env は .env に設定したWebhook URLの環境変数名です。
+
+[webhooks.main]
+webhook_url_env = "DISCORD_WEBHOOK_URL"
+
+# このWebhookで強調表示する地点（任意、件数の固定上限なし）。
+# pref と name は情報源の文字列と照合され、label は通知に表示します。
+watched_points = [
+  { pref = "東京都", name = "東京都23区", label = "自宅周辺" },
+  { pref = "神奈川県", name = "神奈川県東部", label = "職場周辺" },
+]
+
+# 10=震度1, 20=2, 30=3, 40=4, 45=5弱, 50=5強, 55=6弱, 60=6強, 70=7
+other_min_scale = 50
+# 未指定の地方は other_min_scale を使います。
+region_min_scales = { "関東" = 40, "近畿" = 40 }
+
+attach_map = true
+tile_url_template = "https://cyberjapandata.gsi.go.jp/xyz/blank/{z}/{x}/{y}.png"
+
+# Webhookを追加する場合は、同じ形式のテーブルを増やします。
+# [webhooks.home]
+# webhook_url_env = "DISCORD_WEBHOOK_HOME"
+# watched_points = [
+#   { pref = "大阪府", name = "大阪府北部", label = "職場" },
+# ]
+# other_min_scale = 50
+# region_min_scales = { "近畿" = 40 }
+# attach_map = false
+#
+# [webhooks.office]
+# webhook_url_env = "DISCORD_WEBHOOK_OFFICE"
+# watched_points = [
+#   { pref = "大阪府", name = "大阪府北部", label = "職場" },
+# ]
+# other_min_scale = 50
+# region_min_scales = { "近畿" = 40 }
+# attach_map = false

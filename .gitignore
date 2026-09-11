@@ -2,7 +2,7 @@
 .env
 *.png
 
-# Webhook URL を含む個別の通知設定（雛形は追跡する）
+# Webhook URLを含む環境ファイル（雛形は追跡する）
 .env.*
 !.env.example
 !.env.*.example

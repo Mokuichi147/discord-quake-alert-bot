@@ -13,7 +13,7 @@ mod model;
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -286,24 +286,67 @@ fn run_search_point_command(args: &[String]) -> Result<bool> {
     Ok(true)
 }
 
+/// 通知設定ファイルのパスをコマンドラインから取得する。
+///
+/// 指定が無い場合は`QUAKE_ALERT_CONFIG`、それも無ければ`config.toml`を使う。
+fn config_path_from_args(args: &[String]) -> Result<PathBuf> {
+    let mut path = std::env::var("QUAKE_ALERT_CONFIG")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("config.toml"));
+    let mut index = 1;
+    while index < args.len() {
+        if args[index] == "--config" {
+            ensure_next_config_path(args.get(index + 1).map(String::as_str), &mut path)?;
+            index += 2;
+        } else if let Some(value) = args[index].strip_prefix("--config=") {
+            ensure_next_config_path(Some(value), &mut path)?;
+            index += 1;
+        } else {
+            index += 1;
+        }
+    }
+    Ok(path)
+}
+
+fn ensure_next_config_path(value: Option<&str>, path: &mut PathBuf) -> Result<()> {
+    let value = value.ok_or_else(|| anyhow!("--configの値を指定してください"))?;
+    if value.trim().is_empty() {
+        return Err(anyhow!("--configのパスを指定してください"));
+    }
+    *path = PathBuf::from(value);
+    Ok(())
+}
+
 /// 通知を送信せず、履歴 API の最新報から地図画像だけを生成する CLI を実行する。
 ///
 /// 画像の座標やマーカー配置を目視で確認したいときに使う。出力先を指定しない場合は
 /// システムの一時ディレクトリへ保存するため、リポジトリのファイルを変更しない。
-async fn run_preview_map_command(args: &[String]) -> Result<bool> {
+async fn run_preview_map_command(args: &[String], config_path: &Path) -> Result<bool> {
     if args.get(1).map(String::as_str) != Some("preview-map") {
         return Ok(false);
     }
 
     if matches!(args.get(2).map(String::as_str), Some("-h" | "--help")) {
         println!(
-            "使い方: cargo run -- preview-map [出力先] [--richest]\nデフォルトの出力先: システム一時ディレクトリの quake-alert-bot-preview.webp\n--richest を付けると、履歴内で観測地点が最も多い報を選びます。\n"
+            "使い方: cargo run -- preview-map [出力先] [--richest] [--config PATH]\nデフォルトの出力先: システム一時ディレクトリの quake-alert-bot-preview.webp\n--richest を付けると、履歴内で観測地点が最も多い報を選びます。\n--config を省略すると config.toml を使います。\n"
         );
         return Ok(true);
     }
     let mut output = None;
     let mut richest = false;
-    for argument in args.iter().skip(2) {
+    let mut index = 2;
+    while index < args.len() {
+        let argument = &args[index];
+        if argument == "--config" {
+            index += 2;
+            continue;
+        }
+        if argument.starts_with("--config=") {
+            index += 1;
+            continue;
+        }
         if argument == "--richest" {
             richest = true;
         } else if output.is_none() {
@@ -311,6 +354,7 @@ async fn run_preview_map_command(args: &[String]) -> Result<bool> {
         } else {
             return Err(anyhow!("出力先は1つだけ指定してください: {argument}"));
         }
+        index += 1;
     }
 
     let output =
@@ -349,9 +393,7 @@ async fn run_preview_map_command(args: &[String]) -> Result<bool> {
     let (quake, hypocenter, markers) =
         selected.ok_or_else(|| anyhow!("履歴に地図を生成できる地震情報がありませんでした"))?;
 
-    let tile_tpl = std::env::var("TILE_URL_TEMPLATE").unwrap_or_else(|_| {
-        "https://cyberjapandata.gsi.go.jp/xyz/blank/{z}/{x}/{y}.png".to_string()
-    });
+    let tile_tpl = Config::tile_url_template_from_file(config_path)?;
     let scale = quake.earthquake.max_scale;
     let marker_count = markers.len();
     let task = tokio::task::spawn_blocking(move || match hypocenter {
@@ -390,10 +432,11 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    // .env があれば読み込む（無ければ無視）。プレビューでもタイル設定を使えるよう、
-    // 通知用の設定を読む前に読み込む。
+    // .env があれば読み込む（無ければ無視）。Webhook URLなどの秘密値を環境変数から
+    // 読めるよう、TOML設定を読む前に読み込む。
     let _ = dotenvy::dotenv();
-    if run_preview_map_command(&args).await? {
+    let config_path = config_path_from_args(&args)?;
+    if run_preview_map_command(&args, &config_path).await? {
         return Ok(());
     }
 
@@ -404,8 +447,9 @@ async fn main() -> Result<()> {
         )
         .init();
 
-    let config = Config::from_env()?;
+    let config = Config::from_file(&config_path)?;
     info!(
+        config = %config_path.display(),
         ws_url = %config.ws_url,
         webhooks = config.webhooks.len(),
         "地震botを起動しました"
@@ -1339,7 +1383,7 @@ async fn run_test_prompt(config: &WebhookConfig, http: &reqwest::Client) -> Resu
         }
     }
 
-    warn!("震源未確定で通知条件を満たす報が履歴にありませんでした。しきい値（OTHER_MIN_SCALE 等）を下げて再試行してください");
+    warn!("震源未確定で通知条件を満たす報が履歴にありませんでした。TOMLのother_min_scale等を下げて再試行してください");
     Ok(())
 }
 
