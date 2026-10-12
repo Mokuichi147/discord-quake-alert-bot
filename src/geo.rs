@@ -12,8 +12,16 @@ use std::sync::OnceLock;
 
 use anyhow::{ensure, Result};
 
-use crate::intensity::{display_pref, eew_area_scale, normalize_pref};
+use crate::intensity::{display_pref, eew_area_scale, normalize_pref, scale_label};
 use crate::model::{EewArea, Point};
+
+mod eew_area_data {
+    include!("geo_area_data.rs");
+}
+
+mod eew_area_centers {
+    include!("geo_area_centers.rs");
+}
 
 /// 気象庁公開の観測点マップから生成した都道府県・観測点名・緯度・経度のTSV。
 /// 気象庁・地方公共団体・防災科学技術研究所の観測点を含む。
@@ -71,6 +79,143 @@ fn station_coords() -> &'static StationCoords {
 /// 都道府県・観測点名から公開データの座標を引く。未収録の地点は None。
 pub fn observation_point_coord(pref: &str, addr: &str) -> Option<(f64, f64)> {
     station_coords().get(&(normalize_pref(pref), addr)).copied()
+}
+
+/// 市区町村名の最長一致で、観測点名から所属する細分区域を求める。
+///
+/// 観測点名には「静岡菊川市」のように都道府県名が先頭に付く表記もあるため、
+/// 都道府県名を除いた候補も照合する。市区町村の対応は、観測点ごとではなく
+/// 気象庁の公式区域表にある市区町村単位で保持する。
+fn eew_forecast_area_by_name(pref: &str, station_name: &str) -> Option<&'static str> {
+    let normalized_pref = normalize_pref(pref);
+    let without_pref = station_name
+        .strip_prefix(normalized_pref)
+        .unwrap_or(station_name);
+    let mut best: Option<(&'static str, usize)> = None;
+    let mut ambiguous = false;
+
+    for &(rule_pref, municipality, area_name) in eew_area_data::EEW_AREA_MUNICIPALITIES {
+        if normalize_pref(rule_pref) != normalized_pref {
+            continue;
+        }
+        if !station_name.starts_with(municipality) && !without_pref.starts_with(municipality) {
+            continue;
+        }
+        let municipality_len = municipality.len();
+        match best {
+            None => best = Some((area_name, municipality_len)),
+            Some((_, best_len)) if municipality_len > best_len => {
+                best = Some((area_name, municipality_len));
+                ambiguous = false;
+            }
+            Some((best_area, best_len))
+                if municipality_len == best_len && best_area != area_name =>
+            {
+                ambiguous = true;
+            }
+            _ => {}
+        }
+    }
+
+    (!ambiguous)
+        .then(|| best.map(|(area_name, _)| area_name))
+        .flatten()
+}
+
+/// 市区町村名を取り出せない地点に対する座標補完の境界例外。
+///
+/// 観測点TSVの座標は小数第2位で、予報区境界付近では代表座標の最近傍だけでは
+/// 公式区域とずれるため、現在の空港位置について明示する。
+const EEW_COORDINATE_AREA_OVERRIDES: &[(&str, &str, &str)] = &[
+    ("千葉県", "成田国際空港", "千葉県北東部"),
+    ("大阪府", "大阪国際空港", "大阪府北部"),
+];
+
+/// 市区町村名を抽出できない観測点を、同じ都道府県の区域代表座標で補完する。
+fn eew_forecast_area_by_coordinate(pref: &str, station_name: &str) -> Option<&'static str> {
+    let normalized_pref = normalize_pref(pref);
+    if let Some((_, _, area_name)) =
+        EEW_COORDINATE_AREA_OVERRIDES
+            .iter()
+            .find(|(rule_pref, name, _)| {
+                normalize_pref(rule_pref) == normalized_pref && *name == station_name
+            })
+    {
+        return Some(area_name);
+    }
+
+    let target = observation_point_coord(pref, station_name)?;
+    eew_area_centers::EEW_AREA_CENTERS
+        .iter()
+        .filter(|(_, area_pref, _, _)| normalize_pref(area_pref) == normalized_pref)
+        .min_by(|left, right| {
+            let left_distance = distance_km(target, (left.2, left.3));
+            let right_distance = distance_km(target, (right.2, right.3));
+            left_distance
+                .total_cmp(&right_distance)
+                .then_with(|| left.0.cmp(right.0))
+        })
+        .map(|(area_name, _, _, _)| *area_name)
+}
+
+/// 都道府県と観測点名から、所属する緊急地震速報の細分区域名を引く。
+pub fn eew_forecast_area(pref: &str, station_name: &str) -> Option<&'static str> {
+    eew_forecast_area_by_name(pref, station_name)
+        .or_else(|| eew_forecast_area_by_coordinate(pref, station_name))
+}
+
+/// 予報区名の全角英数字などの表記差を吸収して照合する。
+pub fn eew_area_name_matches(left: &str, right: &str) -> bool {
+    normalize_search_text(left) == normalize_search_text(right)
+}
+
+/// 観測点座標を解決できた震度情報と、登録地点からの距離。
+#[derive(Debug, Clone, Copy)]
+pub struct NearbyObservation<'a> {
+    pub point: &'a Point,
+    pub distance_km: f64,
+}
+
+/// 登録地点の座標から、一定距離以内で最も近い実測観測点を探す。
+///
+/// 区域名（`isArea=true`）、座標TSVにない地点、震度不明・推定値の地点は候補にしない。
+/// 都道府県代表座標へのフォールバックも、観測点までの距離が分からなくなるため使わない。
+pub fn nearest_observed_point(
+    target: (f64, f64),
+    points: &[Point],
+    max_distance_km: f64,
+) -> Option<NearbyObservation<'_>> {
+    if !max_distance_km.is_finite() || max_distance_km <= 0.0 {
+        return None;
+    }
+
+    points
+        .iter()
+        .filter(|point| !point.is_area && point.scale != 46 && scale_label(point.scale) != "不明")
+        .filter_map(|point| {
+            let coord = observation_point_coord(&point.pref, &point.addr)?;
+            let distance_km = distance_km(target, coord);
+            (distance_km <= max_distance_km).then_some(NearbyObservation { point, distance_km })
+        })
+        .min_by(|left, right| {
+            left.distance_km
+                .total_cmp(&right.distance_km)
+                .then_with(|| left.point.pref.cmp(&right.point.pref))
+                .then_with(|| left.point.addr.cmp(&right.point.addr))
+        })
+}
+
+/// 緯度経度間の大円距離(km)。
+fn distance_km(from: (f64, f64), to: (f64, f64)) -> f64 {
+    const EARTH_RADIUS_KM: f64 = 6_371.0088;
+    let (from_lat, from_lon) = (from.0.to_radians(), from.1.to_radians());
+    let (to_lat, to_lon) = (to.0.to_radians(), to.1.to_radians());
+    let delta_lat = to_lat - from_lat;
+    let delta_lon = to_lon - from_lon;
+    let haversine = (delta_lat / 2.0).sin().powi(2)
+        + from_lat.cos() * to_lat.cos() * (delta_lon / 2.0).sin().powi(2);
+    let haversine = haversine.min(1.0);
+    2.0 * EARTH_RADIUS_KM * haversine.sqrt().atan2((1.0 - haversine).sqrt())
 }
 
 /// 検索用に全角英数字・空白・区切り記号の違いを吸収する。
@@ -300,6 +445,7 @@ pub fn eew_areas_to_markers(areas: &[EewArea]) -> Vec<(f64, f64, i32)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sha2::{Digest, Sha256};
 
     fn pt(pref: &str, scale: i32) -> Point {
         Point {
@@ -329,6 +475,130 @@ mod tests {
     fn observation_point_lookup() {
         assert!(observation_point_coord("青森県", "八戸市湊町").is_some());
         assert!(observation_point_coord("青森県", "存在しない観測点").is_none());
+    }
+
+    #[test]
+    fn every_observation_station_has_an_eew_forecast_area() {
+        assert_eq!(observation_stations().len(), 4368);
+        let name_matches = observation_stations()
+            .iter()
+            .filter(|station| eew_forecast_area_by_name(station.pref, station.name).is_some())
+            .count();
+        assert_eq!(name_matches, 4355);
+        let mut station_areas = Vec::new();
+        for station in observation_stations() {
+            let area = eew_forecast_area(station.pref, station.name)
+                .unwrap_or_else(|| panic!("予報区が未登録: {} {}", station.pref, station.name));
+            assert!(
+                eew_area_centers::EEW_AREA_CENTERS
+                    .iter()
+                    .any(|(known_area, pref, _, _)| {
+                        normalize_pref(pref) == normalize_pref(station.pref)
+                            && eew_area_name_matches(known_area, area)
+                    }),
+                "予報区が区域一覧にありません: {} {} → {}",
+                station.pref,
+                station.name,
+                area
+            );
+            station_areas.push((station.pref, station.name, area));
+        }
+        station_areas.sort_unstable();
+        let mut digest = Sha256::new();
+        for (pref, station, area) in station_areas {
+            digest.update(format!("{pref}\t{station}\t{area}\n"));
+        }
+        // 公式区域表との全件照合後の割当てを固定し、別の有効区域への誤変更も検出する。
+        assert_eq!(
+            format!("{:x}", digest.finalize()),
+            "7606be15a5e7ca673f14003d2768d7e16bf190b5e293ef6bebfd1c372c7a0efa"
+        );
+    }
+
+    #[test]
+    fn unresolved_observation_stations_use_coordinate_area_fallback() {
+        let airports = [
+            ("北海道", "新千歳空港", "石狩地方南部"),
+            ("宮城県", "仙台空港", "宮城県南部"),
+            ("千葉県", "成田国際空港", "千葉県北東部"),
+            ("東京都", "東京国際空港", "東京都２３区"),
+            ("新潟県", "新潟空港", "新潟県下越"),
+            ("愛知県", "中部国際空港", "愛知県西部"),
+            ("大阪府", "大阪国際空港", "大阪府北部"),
+            ("大阪府", "関西国際空港", "大阪府南部"),
+            ("広島県", "広島空港", "広島県南東部"),
+            ("香川県", "高松空港", "香川県東部"),
+            ("福岡県", "福岡空港", "福岡県福岡"),
+            ("鹿児島県", "鹿児島空港", "鹿児島県薩摩"),
+            ("沖縄県", "那覇空港", "沖縄県本島中南部"),
+        ];
+
+        for (pref, station_name, expected) in airports {
+            assert_eq!(eew_forecast_area_by_name(pref, station_name), None);
+            assert_eq!(eew_forecast_area(pref, station_name), Some(expected));
+        }
+    }
+
+    #[test]
+    fn station_name_prefixes_resolve_different_areas() {
+        assert_eq!(
+            eew_forecast_area_by_name("三重県", "三重明和町馬之上"),
+            Some("三重県中部")
+        );
+        assert_eq!(
+            eew_forecast_area_by_name("三重県", "三重朝日町小向"),
+            Some("三重県北部")
+        );
+        assert_eq!(
+            eew_forecast_area_by_name("静岡県", "静岡菊川市堀之内"),
+            Some("静岡県西部")
+        );
+    }
+
+    #[test]
+    fn eew_area_name_matching_absorbs_fullwidth_digits() {
+        assert!(eew_area_name_matches("東京都２３区", "東京都23区"));
+        assert!(!eew_area_name_matches("東京都２３区", "東京都多摩東部"));
+    }
+
+    #[test]
+    fn nearest_observation_uses_only_resolved_measured_points() {
+        let target = observation_point_coord("青森県", "八戸市湊町").unwrap();
+        let points = vec![
+            // 同じ名称でも区域値は観測点の近隣値に使わない。
+            Point {
+                pref: "青森県".to_string(),
+                addr: "八戸市湊町".to_string(),
+                is_area: true,
+                scale: 70,
+            },
+            // 座標が無い地点は候補にしない。
+            pt_addr("青森県", "存在しない観測点", 60),
+            // 震度不明の地点は候補にしない。
+            pt_addr("青森県", "八戸市湊町", -1),
+            // 46は実測値ではなく「5弱以上と推定」なので候補にしない。
+            pt_addr("青森県", "八戸市湊町", 46),
+            // 有効な実測値だけが選ばれる。
+            pt_addr("青森県", "八戸市湊町", 30),
+        ];
+
+        let nearest = nearest_observed_point(target, &points, 1.0).unwrap();
+        assert_eq!(nearest.point.addr, "八戸市湊町");
+        assert_eq!(nearest.point.scale, 30);
+        assert_eq!(nearest.distance_km, 0.0);
+        assert!(
+            nearest_observed_point(target, &[pt_addr("青森県", "八戸市湊町", 46)], 1.0).is_none()
+        );
+    }
+
+    #[test]
+    fn nearest_observation_respects_distance_limit() {
+        let target = observation_point_coord("北海道", "石狩市花川").unwrap();
+        let points = vec![pt_addr("青森県", "八戸市湊町", 30)];
+
+        assert!(nearest_observed_point(target, &points, 10.0).is_none());
+        assert!(nearest_observed_point(target, &points, 1_000.0).is_some());
+        assert!(nearest_observed_point(target, &points, 0.0).is_none());
     }
 
     #[test]

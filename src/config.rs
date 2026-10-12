@@ -27,6 +27,12 @@ pub struct WebhookConfig {
     pub webhook_url: String,
     /// この送信先で強調表示する地域・観測点。
     pub watched_points: Vec<WatchedPoint>,
+    /// 完全一致する観測点がないとき、近隣観測点の値を表示するか。
+    pub nearby_intensity_fallback: bool,
+    /// 近隣観測値として許容する最大距離(km)。
+    pub nearby_intensity_max_distance_km: f64,
+    /// 登録観測点が含まれないとき、所属するEEW細分区域の予想値を表示するか。
+    pub eew_forecast_area_fallback: bool,
     /// 地方ごとの通知する最小スケール。未設定の地方は`other_min_scale`。
     pub region_min_scales: HashMap<String, i32>,
     pub other_min_scale: i32,
@@ -52,6 +58,12 @@ struct TomlWebhookConfig {
     #[serde(default)]
     watched_points: Vec<WatchedPoint>,
     #[serde(default)]
+    nearby_intensity_fallback: bool,
+    #[serde(default = "default_nearby_intensity_max_distance_km")]
+    nearby_intensity_max_distance_km: f64,
+    #[serde(default = "default_eew_forecast_area_fallback")]
+    eew_forecast_area_fallback: bool,
+    #[serde(default)]
     region_min_scales: HashMap<String, i32>,
     #[serde(default = "default_other_min_scale")]
     other_min_scale: i32,
@@ -66,6 +78,14 @@ fn default_other_min_scale() -> i32 {
 }
 
 fn default_attach_map() -> bool {
+    true
+}
+
+fn default_nearby_intensity_max_distance_km() -> f64 {
+    10.0
+}
+
+fn default_eew_forecast_area_fallback() -> bool {
     true
 }
 
@@ -152,6 +172,12 @@ impl WebhookConfig {
                 format!("webhooks.{name}が参照する環境変数{env_name}が未設定または空です")
             })?;
 
+        ensure!(
+            raw.nearby_intensity_max_distance_km.is_finite()
+                && raw.nearby_intensity_max_distance_km > 0.0,
+            "webhooks.{name}.nearby_intensity_max_distance_kmは正の有限値で指定してください"
+        );
+
         for region in raw.region_min_scales.keys() {
             ensure!(
                 REGIONS.iter().any(|(known, _)| *known == region),
@@ -164,6 +190,9 @@ impl WebhookConfig {
             webhook_url,
             watched_points: normalize_watched_points(raw.watched_points)
                 .with_context(|| format!("webhooks.{name}.watched_pointsが不正です"))?,
+            nearby_intensity_fallback: raw.nearby_intensity_fallback,
+            nearby_intensity_max_distance_km: raw.nearby_intensity_max_distance_km,
+            eew_forecast_area_fallback: raw.eew_forecast_area_fallback,
             region_min_scales: raw.region_min_scales,
             other_min_scale: raw.other_min_scale,
             attach_map: raw.attach_map,
@@ -235,6 +264,9 @@ watched_points = [
   { pref = " 東京都 ", name = "東京都23区", label = " 自宅周辺 " },
   { pref = "東京都", name = "東京都23区", label = "自宅周辺" },
 ]
+nearby_intensity_fallback = true
+nearby_intensity_max_distance_km = 7.5
+eew_forecast_area_fallback = true
 other_min_scale = 40
 region_min_scales = { "関東" = 30, "近畿" = 45 }
 tile_url_template = "home-tiles"
@@ -260,6 +292,9 @@ attach_map = false
         assert_eq!(home.webhook_url, "https://example.com/home");
         assert_eq!(home.watched_points.len(), 1);
         assert_eq!(home.watched_points[0].label, "自宅周辺");
+        assert!(home.nearby_intensity_fallback);
+        assert_eq!(home.nearby_intensity_max_distance_km, 7.5);
+        assert!(home.eew_forecast_area_fallback);
         assert_eq!(home.region_min_scales["関東"], 30);
         assert_eq!(home.other_min_scale, 40);
         assert_eq!(home.tile_url_template, "home-tiles");
@@ -286,6 +321,9 @@ webhook_url_env = "DISCORD_WEBHOOK_URL"
         let hook = &config.webhooks[0];
         assert_eq!(hook.other_min_scale, 50);
         assert!(hook.attach_map);
+        assert!(!hook.nearby_intensity_fallback);
+        assert_eq!(hook.nearby_intensity_max_distance_km, 10.0);
+        assert!(hook.eew_forecast_area_fallback);
         assert_eq!(hook.tile_url_template, DEFAULT_TILE_URL_TEMPLATE);
         assert!(hook.watched_points.is_empty());
     }
@@ -325,6 +363,11 @@ region_min_scales = { "関東圏" = 40 }
         assert!(config(
             "[webhooks.main]\nwebhook_url_env = \"DISCORD_WEBHOOK_URL\"\n",
             &[],
+        )
+        .is_err());
+        assert!(config(
+            "[webhooks.main]\nwebhook_url_env = \"DISCORD_WEBHOOK_URL\"\nnearby_intensity_max_distance_km = 0\n",
+            &[("DISCORD_WEBHOOK_URL", "url")],
         )
         .is_err());
         assert!(config("", &[]).is_err());

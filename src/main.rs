@@ -1591,7 +1591,13 @@ async fn handle_quake(
     .await;
 
     let mut payload = discord::build_payload(&quake, &decision.reason, image.is_some(), is_test);
-    discord::highlight_watched_quake(&mut payload, &quake, &config.watched_points);
+    discord::highlight_watched_quake_with_fallback(
+        &mut payload,
+        &quake,
+        &config.watched_points,
+        config.nearby_intensity_fallback,
+        config.nearby_intensity_max_distance_km,
+    );
     let signature = signature_of(&payload);
     let key = eq.time.clone();
 
@@ -1720,7 +1726,12 @@ async fn handle_eew(
     .await;
 
     let mut payload = discord::build_eew_payload(&eew, &reason, image.is_some(), is_test);
-    discord::highlight_watched_eew(&mut payload, &eew, &config.watched_points);
+    discord::highlight_watched_eew_with_fallback(
+        &mut payload,
+        &eew,
+        &config.watched_points,
+        config.eew_forecast_area_fallback,
+    );
     let signature = signature_of(&payload);
 
     // 投稿済みなら同じメッセージを差し替え、未投稿なら新規投稿する（551 と同じ方針）。
@@ -1896,6 +1907,9 @@ mod tests {
             webhook_url: "http://127.0.0.1:1/failing-webhook".to_string(),
             name: "test".to_string(),
             watched_points: Vec::new(),
+            nearby_intensity_fallback: false,
+            nearby_intensity_max_distance_km: 10.0,
+            eew_forecast_area_fallback: true,
             region_min_scales: HashMap::new(),
             other_min_scale: 50,
             attach_map: false,

@@ -2,6 +2,8 @@
 
 `observation_stations.tsv` は、気象庁の「震度観測点」マップが使用する公開JSONを、quake-alert-botが都道府県名・観測点名・緯度・経度のTSVに加工したものです。
 
+556の予報区補完では、観測点名から市区町村名を最長一致で取り出し、気象庁の「緊急地震速報や震度情報で用いる区域の名称」にある市区町村・細分区域の関係を使います。市区町村を取り出せない地点は、同じ都道府県の区域代表座標から補完します。このルールは観測点ごとのTSVではなく、`src/geo_area_data.rs` と `src/geo_area_centers.rs` に静的データとして組み込みます。
+
 - 出典：[気象庁「震度観測点」](https://ds.data.jma.go.jp/eqev/data/intens-st/)
 - 元データ：[stations.json](https://ds.data.jma.go.jp/eqev/data/intens-st/stations.json)
 - 取得・利用確認日：2026-09-08（日本時間）
@@ -34,6 +36,7 @@
 - 座標は公開JSONに含まれる現行値だけを使用します。旧座標の補完、移転履歴の推測、公開JSONにない旧観測点の追加は行いません。
 - botは都道府県と観測点名を組み合わせて完全一致で照合します。都・府・県の接尾辞の違いは吸収します。
 - 551の`points.isArea=true`は観測点ではなく区域名です。区域名の座標はこのTSVから引かず、都道府県代表座標へ集約します。551の`points.isArea=false`だけが観測点TSVの照合対象です。
+- 556の観測点から予報区への補完は、市区町村名の最長一致を優先します。空港など市区町村名を含まない13地点は、同じ都道府県の細分区域代表座標から補完し、境界で不安定な2地点は明示的に固定します。
 - 未収録の観測点、震度速報・緊急地震速報の地域名は従来どおり都道府県代表座標へ集約します。このデータで地域の境界・代表点を求めることはできません。
 
 ## 更新方法
@@ -64,5 +67,18 @@ P2P履歴と観測点名の一致を監査する場合：
 ```sh
 cargo run --bin audit_p2p_points -- /path/to/history.json
 ```
+
+区域名称表と区域代表座標は、気象庁の公開情報をRustの静的データとして `src/geo_area_data.rs` と `src/geo_area_centers.rs` に収録しています。区域表は[気象庁の区域名称表](https://www.jma.go.jp/jma/kishou/know/jishin/joho/shindo-name.html)、代表座標は[AreaForecastLocalE GIS](https://www.data.jma.go.jp/developer/gis/20240520_AreaForecastLocalE_GIS.zip)に基づきます。代表座標は、GISの各区域ポリゴンの全頂点の緯度・経度をそれぞれ平均し、小数第6位に丸めた値です。市区町村単位の対応と区域代表座標を、Rustの補助バイナリで再現・照合できます。
+
+公式HTMLとGISのZIPを取得し、ZIP内の `.shp` と `.dbf` を展開してから、次のコマンドを実行してください。既定では組み込みデータと公式データを全件比較し、ファイルを変更しません。
+
+```sh
+cargo run --bin update_geo_areas -- \
+  --area-html /path/to/shindo-name.html \
+  --gis-shp /path/to/areas.shp \
+  --gis-dbf /path/to/areas.dbf
+```
+
+公式データが変わった場合は、差分と出典を確認し、同じコマンドに `--write` を追加してRustデータを更新してください。更新後は `cargo fmt` と `cargo test --offline` を実行し、上記の照合コマンドを再実行します。`src/geo.rs` の全地点割当てSHA-256テストが失敗した場合は、変更された区域を確認してから期待値を更新してください。現在の検証では、市区町村名の機械的な一致が4,355地点、座標補完が13地点です。観測点ごとの対応表を追加したり、区域データを地点単位で手編集したりする必要はありません。
 
 公開JSONはマップ用の静的ファイルであり、固定仕様のAPIとしての保証は確認できません。URL・形式の変更時は更新コマンドを見直してください。bot稼働時には組み込みTSVを使うため、取得先の障害は通知処理へ影響しません。

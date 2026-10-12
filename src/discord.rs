@@ -8,6 +8,10 @@ use serde_json::{json, Value};
 use tracing::warn;
 
 use crate::config::WatchedPoint;
+use crate::geo::{
+    eew_area_name_matches, eew_forecast_area, nearest_observed_point, observation_point_coord,
+    NearbyObservation,
+};
 use crate::intensity::{
     eew_area_scale, eew_max_scale, eew_max_scale_label, eew_scale_label, embed_color, has_tsunami,
     is_unbounded_at, normalize_pref, scale_label, tsunami_grade_color, tsunami_grade_label,
@@ -17,8 +21,7 @@ use crate::model::{Eew, JmaQuake, Point, Tsunami};
 
 const MAP_FILE_NAME: &str = "quake.webp";
 
-/// 登録名は都道府県と地域・観測点名の完全一致で照合する。
-/// 周辺地域の値から登録地点の震度を推測しない。
+/// 登録名を都道府県と地域・観測点名で完全一致照合する。
 fn matches_watched(point: &WatchedPoint, pref: &str, name: &str) -> bool {
     normalize_pref(&point.pref) == normalize_pref(pref) && point.name == name
 }
@@ -36,14 +39,41 @@ fn escape_markdown(value: &str) -> String {
 }
 
 fn watched_line(point: &WatchedPoint, intensity: &str) -> String {
+    let place = watched_place(point);
+    format!("**{place}：震度{intensity}**")
+}
+
+fn watched_place(point: &WatchedPoint) -> String {
     let name = escape_markdown(&point.name);
     let pref = escape_markdown(&point.pref);
-    let place = if point.label.is_empty() {
+    if point.label.is_empty() {
         format!("{name}（{pref}）")
     } else {
         format!("{}（{pref}・{name}）", escape_markdown(&point.label))
-    };
-    format!("**{place}：震度{intensity}**")
+    }
+}
+
+fn format_distance_km(distance_km: f64) -> String {
+    if distance_km < 1.0 {
+        format!("{distance_km:.2}")
+    } else {
+        format!("{distance_km:.1}")
+    }
+}
+
+fn nearby_watched_line(point: &WatchedPoint, observation: NearbyObservation<'_>) -> String {
+    let source = format!(
+        "{}・{}（約{}km）",
+        escape_markdown(&observation.point.pref),
+        escape_markdown(&observation.point.addr),
+        format_distance_km(observation.distance_km)
+    );
+    format!(
+        "**{} → {}：震度{}**",
+        watched_place(point),
+        source,
+        scale_label(observation.point.scale)
+    )
 }
 
 /// 件数にかかわらず Discord のフィールド長上限に収め、超過件数を明示する。
@@ -70,52 +100,135 @@ fn prepend_watched_field(payload: &mut Value, title: &str, lines: Vec<String>) {
 
 /// 情報源に含まれる登録地点の観測震度を先頭に表示する。
 pub fn highlight_watched_quake(payload: &mut Value, quake: &JmaQuake, watched: &[WatchedPoint]) {
-    let lines = watched
-        .iter()
-        .filter_map(|point| {
-            quake
-                .points
-                .iter()
-                .filter(|p| {
-                    matches_watched(point, &p.pref, &p.addr) && scale_label(p.scale) != "不明"
-                })
-                .max_by_key(|p| p.scale)
-                .map(|p| watched_line(point, scale_label(p.scale)))
-        })
-        .collect();
-    prepend_watched_field(payload, "📍 登録地点の震度", lines);
+    highlight_watched_quake_with_fallback(payload, quake, watched, false, 0.0);
+}
+
+/// 情報源に登録地点の観測震度がないとき、設定された距離以内の近隣観測値を表示する。
+///
+/// 完全一致の観測点は常に優先し、近隣値は登録地点自身の震度と誤認しないよう別フィールド
+/// に表示する。近隣候補の座標は、観測点TSVと名称が一致するものだけを使う。
+pub fn highlight_watched_quake_with_fallback(
+    payload: &mut Value,
+    quake: &JmaQuake,
+    watched: &[WatchedPoint],
+    nearby_fallback: bool,
+    max_distance_km: f64,
+) {
+    let mut exact_lines = Vec::new();
+    let mut nearby_lines = Vec::new();
+
+    for point in watched {
+        let exact = quake
+            .points
+            .iter()
+            .filter(|p| matches_watched(point, &p.pref, &p.addr) && scale_label(p.scale) != "不明")
+            .max_by_key(|p| p.scale);
+        if let Some(exact) = exact {
+            exact_lines.push(watched_line(point, scale_label(exact.scale)));
+            continue;
+        }
+
+        if !nearby_fallback {
+            continue;
+        }
+        let Some(target) = observation_point_coord(&point.pref, &point.name) else {
+            continue;
+        };
+        if let Some(nearby) = nearest_observed_point(target, &quake.points, max_distance_km) {
+            nearby_lines.push(nearby_watched_line(point, nearby));
+        }
+    }
+
+    // 両方ある場合も、正確な登録地点の値を先に表示する。
+    prepend_watched_field(payload, "📍 登録地点の周辺観測値", nearby_lines);
+    prepend_watched_field(payload, "📍 登録地点の震度", exact_lines);
+}
+
+fn eew_intensity(area: &crate::model::EewArea) -> Option<String> {
+    if scale_label(eew_area_scale(area)) == "不明" {
+        return None;
+    }
+    let upper = eew_scale_label(eew_area_scale(area), area.scale_to == 99);
+    Some(
+        if area.scale_to != 99
+            && area.scale_from < area.scale_to
+            && scale_label(area.scale_from) != "不明"
+        {
+            format!("{}〜{upper}", scale_label(area.scale_from))
+        } else {
+            upper
+        },
+    )
+}
+
+fn eew_area_line(point: &WatchedPoint, area: &crate::model::EewArea) -> Option<String> {
+    eew_intensity(area).map(|intensity| watched_line(point, &intensity))
 }
 
 /// 情報源に含まれる登録地域の予想震度を先頭に表示する。取消報には表示しない。
 pub fn highlight_watched_eew(payload: &mut Value, eew: &Eew, watched: &[WatchedPoint]) {
+    highlight_watched_eew_with_fallback(payload, eew, watched, false);
+}
+
+/// 登録観測点がEEWの情報に含まれないとき、所属する細分区域の予想震度を表示する。
+///
+/// 完全一致の予報区登録は常に優先し、補完値は観測点自身の予想値と誤認しないよう
+/// 別フィールドに表示する。観測点と予報区の対応は、気象庁の区域・市町村表を
+/// 収録したRustの静的データを使う。
+pub fn highlight_watched_eew_with_fallback(
+    payload: &mut Value,
+    eew: &Eew,
+    watched: &[WatchedPoint],
+    forecast_area_fallback: bool,
+) {
     if eew.cancelled {
         return;
     }
-    let lines = watched
-        .iter()
-        .filter_map(|point| {
-            eew.areas
-                .iter()
-                .filter(|a| {
-                    matches_watched(point, &a.pref, &a.name)
-                        && scale_label(eew_area_scale(a)) != "不明"
-                })
-                .max_by_key(|a| (a.scale_to == 99, eew_area_scale(a)))
-                .map(|a| {
-                    let upper = eew_scale_label(eew_area_scale(a), a.scale_to == 99);
-                    let intensity = if a.scale_to != 99
-                        && a.scale_from < a.scale_to
-                        && scale_label(a.scale_from) != "不明"
-                    {
-                        format!("{}〜{upper}", scale_label(a.scale_from))
-                    } else {
-                        upper
-                    };
-                    watched_line(point, &intensity)
-                })
-        })
-        .collect();
-    prepend_watched_field(payload, "📍 登録地点の予想震度", lines);
+    let mut exact_lines = Vec::new();
+    let mut forecast_area_lines = Vec::new();
+
+    for point in watched {
+        let exact = eew
+            .areas
+            .iter()
+            .filter(|area| matches_watched(point, &area.pref, &area.name))
+            .filter_map(|area| eew_intensity(area).map(|_| area))
+            .max_by_key(|area| (area.scale_to == 99, eew_area_scale(area)));
+        if let Some(area) = exact {
+            if let Some(line) = eew_area_line(point, area) {
+                exact_lines.push(line);
+            }
+            continue;
+        }
+
+        if !forecast_area_fallback {
+            continue;
+        }
+        let Some(forecast_area_name) = eew_forecast_area(&point.pref, &point.name) else {
+            continue;
+        };
+        let area = eew
+            .areas
+            .iter()
+            .filter(|area| eew_area_name_matches(forecast_area_name, &area.name))
+            .filter_map(|area| eew_intensity(area).map(|_| area))
+            .max_by_key(|area| (area.scale_to == 99, eew_area_scale(area)));
+        let Some(area) = area else {
+            continue;
+        };
+        let Some(intensity) = eew_intensity(area) else {
+            continue;
+        };
+        forecast_area_lines.push(format!(
+            "**{} → 予報区「{}」：予想震度{}**",
+            watched_place(point),
+            escape_markdown(forecast_area_name),
+            intensity
+        ));
+    }
+
+    prepend_watched_field(payload, "📍 登録地点の予報区予想値", forecast_area_lines);
+    prepend_watched_field(payload, "📍 登録地点の予想震度", exact_lines);
 }
 
 /// 送信を諦めるまでの試行回数。
@@ -757,6 +870,53 @@ mod tests {
     }
 
     #[test]
+    fn watched_quake_shows_nearby_observation_separately() {
+        let quake: JmaQuake = serde_json::from_value(json!({
+            "code": 551,
+            "points": [
+                {"pref": "北海道", "addr": "石狩市厚田", "scale": 30}
+            ]
+        }))
+        .unwrap();
+        let watched = vec![watched("北海道", "石狩市花川", "自宅周辺")];
+        let mut payload = build_payload(&quake, "通知理由", false, false);
+
+        highlight_watched_quake_with_fallback(&mut payload, &quake, &watched, true, 100.0);
+
+        let field = &payload["embeds"][0]["fields"][0];
+        assert_eq!(field["name"], "📍 登録地点の周辺観測値");
+        let value = field["value"].as_str().unwrap();
+        assert!(value.contains("自宅周辺（北海道・石狩市花川）"));
+        assert!(value.contains("北海道・石狩市厚田"));
+        assert!(value.contains("震度3"));
+        assert!(value.contains("約"));
+    }
+
+    #[test]
+    fn exact_watched_observation_wins_over_nearby_fallback() {
+        let quake: JmaQuake = serde_json::from_value(json!({
+            "code": 551,
+            "points": [
+                {"pref": "北海道", "addr": "石狩市花川", "scale": 20},
+                {"pref": "北海道", "addr": "石狩市厚田", "scale": 40}
+            ]
+        }))
+        .unwrap();
+        let watched = vec![watched("北海道", "石狩市花川", "自宅周辺")];
+        let mut payload = build_payload(&quake, "通知理由", false, false);
+
+        highlight_watched_quake_with_fallback(&mut payload, &quake, &watched, true, 100.0);
+
+        let fields = payload["embeds"][0]["fields"].as_array().unwrap();
+        assert_eq!(fields[0]["name"], "📍 登録地点の震度");
+        assert_eq!(
+            fields[0]["value"],
+            "**自宅周辺（北海道・石狩市花川）：震度2**"
+        );
+        assert_eq!(fields.len(), 7);
+    }
+
+    #[test]
     fn watched_eew_preserves_forecast_range_and_unbounded_scale() {
         let mut eew: Eew = serde_json::from_value(json!({
             "code":556,"areas":[
@@ -802,6 +962,27 @@ mod tests {
             field["value"],
             "**登録地点（北海道・北海道道北）：震度4〜5強**"
         );
+    }
+
+    #[test]
+    fn watched_eew_falls_back_to_station_forecast_area() {
+        let eew: Eew = serde_json::from_value(json!({
+            "code":556,"areas":[
+                {"pref":"北海道道北","name":"上川地方北部","scaleFrom":45,"scaleTo":99}
+            ]
+        }))
+        .unwrap();
+        let watched = vec![watched("北海道", "上川中川町中川", "登録観測点")];
+        let mut payload = build_eew_payload(&eew, "", false, false);
+
+        highlight_watched_eew_with_fallback(&mut payload, &eew, &watched, true);
+
+        let field = &payload["embeds"][0]["fields"][0];
+        assert_eq!(field["name"], "📍 登録地点の予報区予想値");
+        let value = field["value"].as_str().unwrap();
+        assert!(value.contains("登録観測点（北海道・上川中川町中川）"));
+        assert!(value.contains("予報区「上川地方北部」"));
+        assert!(value.contains("予想震度5弱程度以上"));
     }
 
     #[test]

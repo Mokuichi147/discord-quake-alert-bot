@@ -18,6 +18,15 @@ watched_points = [
   { pref = "神奈川県", name = "神奈川県東部", label = "職場周辺" },
 ]
 
+# 完全一致する観測点が報告にないとき、TSV座標で最も近い実測観測点の値を表示するか。
+# 近隣値は「登録地点の周辺観測値」として、観測点名と距離を付けて表示します。
+nearby_intensity_fallback = false
+# 近隣値として許容する最大距離(km)。
+nearby_intensity_max_distance_km = 10.0
+# 556で登録観測点が含まれないとき、所属する予報区の予想震度を表示するか。
+# 気象庁の公式区域対応表による補完で、既定値はtrue。
+eew_forecast_area_fallback = true
+
 # 10=震度1, 20=2, 30=3, 40=4, 45=5弱, 50=5強, 55=6弱, 60=6強, 70=7
 other_min_scale = 50
 # 未指定の地方は other_min_scale を使います。
