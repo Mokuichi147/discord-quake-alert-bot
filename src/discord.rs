@@ -98,11 +98,6 @@ fn prepend_watched_field(payload: &mut Value, title: &str, lines: Vec<String>) {
     }
 }
 
-/// 情報源に含まれる登録地点の観測震度を先頭に表示する。
-pub fn highlight_watched_quake(payload: &mut Value, quake: &JmaQuake, watched: &[WatchedPoint]) {
-    highlight_watched_quake_with_fallback(payload, quake, watched, false, 0.0);
-}
-
 /// 情報源に登録地点の観測震度がないとき、設定された距離以内の近隣観測値を表示する。
 ///
 /// 完全一致の観測点は常に優先し、近隣値は登録地点自身の震度と誤認しないよう別フィールド
@@ -163,11 +158,6 @@ fn eew_intensity(area: &crate::model::EewArea) -> Option<String> {
 
 fn eew_area_line(point: &WatchedPoint, area: &crate::model::EewArea) -> Option<String> {
     eew_intensity(area).map(|intensity| watched_line(point, &intensity))
-}
-
-/// 情報源に含まれる登録地域の予想震度を先頭に表示する。取消報には表示しない。
-pub fn highlight_watched_eew(payload: &mut Value, eew: &Eew, watched: &[WatchedPoint]) {
-    highlight_watched_eew_with_fallback(payload, eew, watched, false);
 }
 
 /// 登録観測点がEEWの情報に含まれないとき、所属する細分区域の予想震度を表示する。
@@ -849,7 +839,7 @@ mod tests {
         ];
         let base = build_payload(&quake, "通知理由", false, false);
         let mut payload = base.clone();
-        highlight_watched_quake(&mut payload, &quake, &watched);
+        highlight_watched_quake_with_fallback(&mut payload, &quake, &watched, false, 0.0);
         assert_eq!(
             payload["embeds"][0]["fields"][0]["name"],
             "📍 登録地点の震度"
@@ -859,13 +849,13 @@ mod tests {
             "**自宅周辺（東京・東京都23区）：震度4**"
         );
         let mut unchanged = base.clone();
-        highlight_watched_quake(&mut unchanged, &quake, &[]);
+        highlight_watched_quake_with_fallback(&mut unchanged, &quake, &[], false, 0.0);
         assert_eq!(unchanged, base);
-        highlight_watched_quake(&mut unchanged, &quake, &watched[1..]);
+        highlight_watched_quake_with_fallback(&mut unchanged, &quake, &watched[1..], false, 0.0);
         assert_eq!(unchanged, base);
         quake.points[1].scale = 45;
         let mut revised = base;
-        highlight_watched_quake(&mut revised, &quake, &watched);
+        highlight_watched_quake_with_fallback(&mut revised, &quake, &watched, false, 0.0);
         assert_ne!(payload, revised);
     }
 
@@ -930,7 +920,7 @@ mod tests {
             watched("神奈川県", "神奈川県東部", "職場周辺"),
         ];
         let mut payload = build_eew_payload(&eew, "", false, false);
-        highlight_watched_eew(&mut payload, &eew, &watched);
+        highlight_watched_eew_with_fallback(&mut payload, &eew, &watched, false);
         let field = &payload["embeds"][0]["fields"][0];
         assert_eq!(field["name"], "📍 登録地点の予想震度");
         let value = field["value"].as_str().unwrap();
@@ -939,7 +929,7 @@ mod tests {
         eew.cancelled = true;
         let original = build_eew_payload(&eew, "", false, false);
         let mut cancelled = original.clone();
-        highlight_watched_eew(&mut cancelled, &eew, &watched);
+        highlight_watched_eew_with_fallback(&mut cancelled, &eew, &watched, false);
         assert_eq!(cancelled, original);
     }
 
@@ -954,7 +944,7 @@ mod tests {
         let watched = vec![watched("北海道", "北海道道北", "登録地点")];
         let mut payload = build_eew_payload(&eew, "", false, false);
 
-        highlight_watched_eew(&mut payload, &eew, &watched);
+        highlight_watched_eew_with_fallback(&mut payload, &eew, &watched, false);
 
         let field = &payload["embeds"][0]["fields"][0];
         assert_eq!(field["name"], "📍 登録地点の予想震度");
